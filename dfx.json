@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "canisters": {
+    "crown-indexer": {
+      "type": "rust",
+      "package": "crown-indexer",
+      "candid": "crown-indexer.did"
+    }
+  }
+}

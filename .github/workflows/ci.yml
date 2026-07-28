@@ -1,0 +1,32 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      # Border (01-standards): единственный не-query — платный ingest.
+      - name: single non-query is ingest
+        run: |
+          n="$(grep -cE '\)[[:space:]]*->' crown-indexer.did || true)"
+          q="$(grep -cE 'query;?[[:space:]]*$' crown-indexer.did || true)"
+          test "$((n - q))" -eq 1 || { echo ".did has non-query methods other than ingest"; exit 1; }
+          grep -qE '^[[:space:]]*ingest[[:space:]]*:' crown-indexer.did
+
+      # Border: mainnet-профиль без Custom-источников (проверяем только строки
+      # `source =`, комментарии игнорируются).
+      - name: mainnet has no Custom RPC source
+        run: |
+          ! grep -E '^[[:space:]]*source[[:space:]]*=' config/mainnet.toml | grep -qw Custom

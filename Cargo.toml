@@ -1,0 +1,29 @@
+[package]
+name = "crown-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "Единственный платный индексатор (канистра ICP): книга репутации, derived"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid = "0.10"
+serde = "1"  # #[serde(rename)] на candid-типах RPC-ответа (camelCase поля)
+ic-cdk = "0.20"
+crown-reduce = { path = "../crown-reduce" }
+crown-derive = { path = "../crown-factory/derive" }  # пересчёт PDA эскроу при распознавании рождений
+ic-certified-map = "0.4"  # keyed-Merkle (RbTree) по книге и рождениям, со свидетелями
+sha2 = "0.10"             # combined_root = hash(book_root ‖ births_root); дискриминаторы Anchor
+bs58 = "0.5"              # декод адресов/бинарной tx/данных инструкций из RPC-ответа
+ciborium = "0.2"          # CBOR-сериализация свидетеля (стандартный IC-формат HashTree)
+
+[dev-dependencies]
+solana-program = "2"  # эталонная сериализация транзакции для кросс-проверки парсера
+pocket-ic = "13"      # e2e на реальной IC-реплике (сервер 13.0.0 из комплекта dfx)
+ic-certification = "3"  # проверка сертификата: lookup certified_data в дереве
+serde_cbor = "0.11"     # borrowed CBOR-декод сертификата в тесте (ic-certification zero-copy)
+
+[build-dependencies]
+bs58 = "0.5"   # base58 → [u8;32] адресов из config/ на этапе сборки (в рантайме bs58 нет)
+sha2 = "0.10"  # ChainId = sha256("crown-chain:v1:" ‖ id)

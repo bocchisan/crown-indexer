@@ -1,0 +1,18 @@
+# crown-indexer — devnet-профиль.
+# Ничего сетевого в коде: значения только здесь.
+
+# Профиль-уровень (замораживаемые, пиннятся cost-gate с запасом).
+ingest_price       = 10_000_000_000       # циклы (≈$0.0137), ≥ worst-case outcall
+min_gross          = 200_000              # $0.20 в minor units (USDC 6 знаков)
+cycle_floor        = 1_000_000_000_000    # пол баланса циклов
+attach_cycles      = 2_000_000_000        # циклы на outcall к SOL RPC-канистре (≤ ingest_price)
+response_max_bytes = 20_000               # кэп ответа getTransaction (инвариант #1)
+
+# Per-chain. Провайдеры выбирает SOL RPC-канистра (не URL здесь); индексер всегда
+# использует её `Default`-набор для кластера.
+[[chain]]
+id        = "devnet"
+consensus = 3
+splitter  = "EiLH5hCHpkX1mbPhY2J1QcVyg8vf1NMmSMFgiYzVPDUP"
+usdc      = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+factories = ["9Cjb4fcyQyn3bMaNnkyrhMkG6dfEoo6DJzax7YWGynYb", "81HsKu3FCjzJvuqb8fWQTD4Khc9qSq98CC7Y967Nfnm9"]

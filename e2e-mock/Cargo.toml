@@ -1,0 +1,17 @@
+# Mock canister for the paid-ingest e2e — NOT part of crown-indexer's package
+# (its own workspace root). Plays two roles at one principal: the cycle-attaching
+# caller (relay) and the SOL RPC canister answering `getTransaction`.
+[package]
+name = "mock-sol-rpc"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+candid = "0.10"
+ic-cdk = "0.20"
+serde = "1"

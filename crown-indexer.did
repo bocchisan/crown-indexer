@@ -1,0 +1,37 @@
+// A recorded escrow birth, for `get_birth`.
+type BirthView = record { slot : nat64; donor : blob };
+// Outcome of a paid `ingest`.
+type IngestResult = variant {
+  // Canister balance below `CYCLE_FLOOR` — refused to touch the reserve.
+  LowBalance;
+  // Folded in: counts of settlements, births, and cross-check anomalies.
+  Applied : record { settlements : nat64; anomalies : nat64; births : nat64 };
+  // Attached cycles below `INGEST_PRICE` — rejected before any work.
+  Underpaid;
+  // Signature already folded in, or an identical ingest is in flight — no charge, no outcall.
+  Duplicate;
+  // No finalized transaction under consensus, or it failed / was unreadable.
+  NotFound;
+};
+service : () -> {
+  // Count of cross-check anomalies (event vs executed transfer). Free query.
+  get_anomaly_count : () -> (nat64) query;
+  // Count of applied signatures. Free query (empty signatures are never marked).
+  get_applied_count : () -> (nat64) query;
+  // A birth (if recorded) plus a witness reconstructing to the combined root.
+  get_birth : (blob) -> (opt BirthView, blob) query;
+  // The IC certificate (signed by the NNS root key) over the canister's certified
+  // data, plus the combined root it commits to. A witness verifies against this.
+  get_certificate : () -> (opt blob, blob) query;
+  // Version of the fold (from crown-reduce). Free query.
+  get_reduce_version : () -> (nat32) query;
+  // Reputation at `(chain, donor, recipient)` (0 if absent) plus a witness that
+  // reconstructs to the combined root. Verify it with `get_certificate` against
+  // the NNS root key. Free query. Empty witness on a malformed (non-32B) key.
+  get_reputation : (blob, blob, blob) -> (nat, blob) query;
+  // The single non-`query`: paid ingest of one Solana signature. Order (spec
+  // §Поверхность): `is_applied` → attached ≥ `INGEST_PRICE` → balance ≥
+  // `CYCLE_FLOOR` → **accept cycles** → outcall. No outcall or write before
+  // payment is accepted (non-negativity invariant #1).
+  ingest : (text) -> (IngestResult);
+}

@@ -1,0 +1,18 @@
+# crown-indexer — mainnet-профиль (заморозка P8).
+# Ничего сетевого в коде: значения только здесь. Источники — только Default.
+
+# Профиль-уровень (пиннятся cost-gate).
+ingest_price       = 13_700_000_000
+min_gross          = 200_000
+cycle_floor        = 1_000_000_000_000
+attach_cycles      = 2_000_000_000        # финализируется на cost-gate (P8) по getTransactionCyclesCost
+response_max_bytes = 20_000               # кэп ответа getTransaction (инвариант #1)
+
+# Per-chain. Провайдеры выбирает SOL RPC-канистра (не URL здесь); индексер всегда
+# использует её `Default`-набор для кластера. Консенсус ≥3 провайдера.
+[[chain]]
+id        = "mainnet"
+consensus = 3
+splitter  = "PLACEHOLDER_splitter_mainnet"
+usdc      = "PLACEHOLDER_usdc_mainnet_mint"
+factories = ["PLACEHOLDER_factory_two_outcome", "PLACEHOLDER_factory_stream"]

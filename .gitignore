@@ -1,0 +1,7 @@
+# Build artifacts — at any depth (root target/ and nested e2e-mock/target/)
+target/
+.dfx/
+.anchor/
+test-ledger/
+node_modules/
+# Cargo.lock коммитится (reproducible build; хэш wasm воспроизводим).
