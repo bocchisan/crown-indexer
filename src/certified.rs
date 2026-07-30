@@ -8,12 +8,20 @@
 //! `combined_root = fork_hash(labeled_hash("book", book_root),
 //! labeled_hash("births", births_root))` — a key witness reconstructs straight
 //! to it, so verification against the NNS root key is standard.
+//!
+//! The tree *is* the book: there is no second `crown_reduce::Book` beside it.
+//! Every key would otherwise be stored twice — 144 B of BTreeMap on top of the
+//! 216 B the tree needs anyway, 40% of the only structure that grows forever on
+//! a canister whose heap ceiling cannot be raised (`docs/spec.md §Ёмкость`). The
+//! law stays in one place regardless: `crown_reduce::fold_one` is the
+//! `checked_add`, and this module only decides where the accumulated value is
+//! kept.
 
-use crown_reduce::{reduce, Book, ChainId, Overflow, Settled};
+use crown_reduce::{fold_one, ChainId, Overflow, Settled};
 use ic_certified_map::{
     fork, fork_hash, labeled, labeled_hash, AsHashTree, Hash, HashTree, RbTree,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Sub-tree labels of the combined certified root (domain separation).
 const LABEL_BOOK: &[u8] = b"book";
@@ -35,20 +43,57 @@ fn book_key(chain: ChainId, donor: [u8; 32], recipient: [u8; 32]) -> Vec<u8> {
     k
 }
 
+/// The accumulated `u128` under a book leaf, or `0` if the key is absent (an
+/// absent key reads as zero — the law never subtracts, so there is nothing else
+/// it could mean). A leaf of the wrong width cannot occur: `apply_settlement` is
+/// the only writer and always writes 16 bytes.
+fn leaf_value(leaf: Option<&Vec<u8>>) -> u128 {
+    leaf.and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok())
+        .map(u128::from_le_bytes)
+        .unwrap_or(0)
+}
+
+/// A birth leaf: `donor(32) ‖ u64le(slot)`. `None` on any other width, which
+/// `record_birth` — the only writer — cannot produce.
+fn birth_leaf(leaf: &[u8]) -> Option<Birth> {
+    let donor: [u8; 32] = leaf.get(..32)?.try_into().ok()?;
+    let slot: [u8; 8] = leaf.get(32..40)?.try_into().ok()?;
+    Some(Birth {
+        donor,
+        slot: u64::from_le_bytes(slot),
+    })
+}
+
 /// The derived, certified state of the index.
 pub struct Certified {
-    book: Book,
-    births: BTreeMap<[u8; 32], Birth>,
+    /// The book: `(chain ‖ donor ‖ recipient) → u128le`. Sole storage — the
+    /// certified tree and the map of accumulated values are the same structure.
     book_tree: RbTree<Vec<u8>, Vec<u8>>,
+    /// Populated book keys. `RbTree` has no `len`, and the capacity gauge needs
+    /// the count every ingest — counting the tree would be O(n) on the one
+    /// number that exists to warn before the heap fills.
+    book_keys: u64,
+    /// Births: `escrow → donor ‖ u64le(slot)`. Sole storage, for the same reason
+    /// the book has only one: the tree already holds the whole leaf, so a
+    /// `BTreeMap` beside it stored every birth twice — on the second structure
+    /// that grows forever and is never pruned (`08-deferred.md`), i.e. straight
+    /// out of the generation's capacity (`docs/spec.md §Ёмкость`).
     births_tree: RbTree<Vec<u8>, Vec<u8>>,
+    /// Recorded births — the other half of the capacity gauge (see `book_keys`).
+    births_count: u64,
     /// Exactly-once: signatures already folded in. Every non-empty signature that
     /// reaches the fold is marked (whether or not it yielded a settlement); empty
     /// ones never are (non-negativity invariant #1).
+    ///
+    /// **This set is the whole of exactly-once.** `state::apply` tests it inside
+    /// the same synchronous mutation that sets it, so two ingests of one
+    /// signature cannot both fold, however they raced. Nothing reserves a
+    /// signature ahead of the outcall: a reservation would only save the loser of
+    /// such a race one outcall — paid by whoever submitted the duplicate (`00
+    /// §3.2`) — while committing state before an `await` that a trapped callback
+    /// then rolls back around, wedging the signature for the life of a canister
+    /// nobody can fix.
     applied: BTreeSet<Vec<u8>>,
-    /// Signatures with an ingest in flight (reserved before the outcall await, so
-    /// concurrent same-signature ingests dedup even though `applied` is only set
-    /// after the await). Cleared on success (`mark_applied`) or abort (`release`).
-    in_flight: BTreeSet<Vec<u8>>,
     /// Diagnostic count of cross-check anomalies (a splitter event with no matching
     /// real transfer). Not certified — a health signal, folded in with the book so
     /// a re-ingest rebuilds it alongside everything else.
@@ -64,56 +109,159 @@ impl Default for Certified {
 impl Certified {
     pub fn new() -> Self {
         Self {
-            book: Book::new(),
-            births: BTreeMap::new(),
             book_tree: RbTree::new(),
+            book_keys: 0,
             births_tree: RbTree::new(),
+            births_count: 0,
             applied: BTreeSet::new(),
-            in_flight: BTreeSet::new(),
             anomalies: 0,
         }
     }
 
-    /// Fold a settlement under the crown-reduce law and mirror the changed leaf.
+    /// Fold a settlement into the leaf under the crown-reduce law. Read the
+    /// accumulated value, `fold_one`, write it back — the tree is the book, so
+    /// there is no second structure to keep in step with this one.
     pub fn apply_settlement(&mut self, s: Settled) -> Result<(), Overflow> {
-        reduce(&mut self.book, s)?;
-        let value = self.book.get(&(s.chain, s.donor, s.recipient));
-        self.book_tree.insert(
-            book_key(s.chain, s.donor, s.recipient),
-            value.to_le_bytes().to_vec(),
-        );
+        let key = book_key(s.chain, s.donor, s.recipient);
+        let leaf = self.book_tree.get(&key);
+        // A key with no leaf is a new key. Counted here rather than derived,
+        // because the tree cannot be asked its size (see `book_keys`).
+        let is_new = leaf.is_none();
+        // Overflow is refused *before* the write and before the count moves: a
+        // partially applied fold is a book no recompute reproduces.
+        let next = fold_one(leaf_value(leaf), s.gross)?;
+        if is_new {
+            self.book_keys = self.book_keys.saturating_add(1);
+        }
+        self.book_tree.insert(key, next.to_le_bytes().to_vec());
         Ok(())
     }
 
     /// Record an escrow birth (idempotent by escrow address).
+    ///
+    /// Re-recording an escrow overwrites the leaf and does **not** move the count:
+    /// a birth is one escrow, and the same `create_escrow` re-read yields the same
+    /// address. (On-chain it cannot even differ — the address is a PDA of the salt,
+    /// so a second `create_escrow` for it fails.)
     pub fn record_birth(&mut self, escrow: [u8; 32], b: Birth) {
+        let key = escrow.to_vec();
+        if self.births_tree.get(&key).is_none() {
+            self.births_count = self.births_count.saturating_add(1);
+        }
         let mut v = Vec::with_capacity(40);
         v.extend_from_slice(&b.donor);
         v.extend_from_slice(&b.slot.to_le_bytes());
-        self.births_tree.insert(escrow.to_vec(), v);
-        self.births.insert(escrow, b);
+        self.births_tree.insert(key, v);
     }
 
-    pub fn birth(&self, escrow: &[u8; 32]) -> Option<&Birth> {
-        self.births.get(escrow)
+    /// The recorded birth of `escrow`, read straight off the certified leaf — the
+    /// same bytes the accompanying witness proves.
+    pub fn birth(&self, escrow: &[u8; 32]) -> Option<Birth> {
+        self.births_tree
+            .get(escrow.as_slice())
+            .and_then(|v| birth_leaf(v))
+    }
+
+    /// One page of recorded births in escrow-key order, starting strictly after
+    /// `start_after` (or at the beginning). At most `limit` entries.
+    ///
+    /// Sole consumer: the generational handoff (architecture §8). A settlement is
+    /// attributed to its escrow's funding donor by looking the escrow up in the
+    /// births tree, so a generation that starts empty misattributes every escrow
+    /// born before it — to the escrow address, permanently. `get_birth` cannot
+    /// supply the seed: it answers only for an escrow you already know, and the
+    /// successor by construction does not know them. Hence enumeration, and hence
+    /// it must exist *before* the freeze — a blackholed generation grows no new
+    /// query.
+    ///
+    /// Paged rather than whole so one reply always fits the response limit no
+    /// matter how large the tree has grown; the caller walks pages by feeding the
+    /// last escrow back. `RbTree::iter` is in-order, so a page boundary can neither
+    /// skip nor repeat an entry.
+    ///
+    /// The cursor is a scan, not a seek: `RbTree` exposes no "iterate from key", so
+    /// reaching page `k` walks past the `k · limit` entries before it. Deliberate,
+    /// and the cost is bounded where it lands — this is a free `query` (one node,
+    /// no consensus), its sole caller is the one-off handoff, and the boundary now
+    /// refuses ingress entirely, so it cannot be turned into a paid-work amplifier
+    /// (`lib.rs::inspect_message`). The alternative was keeping a second copy of
+    /// every birth in a `BTreeMap` purely to get `range` — 140 B per birth, forever,
+    /// on the structure that is never pruned and bounds the generation.
+    pub fn births_page(
+        &self,
+        start_after: Option<[u8; 32]>,
+        limit: usize,
+    ) -> Vec<([u8; 32], Birth)> {
+        self.births_tree
+            .iter()
+            // Exclusive lower bound: the cursor entry was returned by the previous
+            // page, so resuming *at* it would repeat one birth per page boundary.
+            .skip_while(|(k, _)| match &start_after {
+                Some(cursor) => k.as_slice() <= cursor.as_slice(),
+                None => false,
+            })
+            .filter_map(|(k, v)| {
+                let escrow: [u8; 32] = k.as_slice().try_into().ok()?;
+                Some((escrow, birth_leaf(v)?))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Number of recorded births — one half of the capacity gauge (see `book_keys`).
+    pub fn births_count(&self) -> u64 {
+        self.births_count
+    }
+
+    /// Number of populated book keys. With `births_count` and the heap size this
+    /// is the capacity gauge: the book is monotone by law (§2) and never shrinks,
+    /// so on a blackholed canister these numbers are the only warning that the
+    /// generation is nearing its end and the cutover must be scheduled. A gauge
+    /// added after the freeze is a gauge that does not exist.
+    pub fn book_keys(&self) -> u64 {
+        self.book_keys
     }
 
     /// Attribute a settlement's real donor (architecture §4): a `Settled` whose
     /// donor is a known escrow (has a birth) is credited to the escrow's funding
     /// donor; otherwise the event donor stands (a direct donation).
     ///
-    /// Ordering invariant: an escrow's birth must be folded before its settlement,
-    /// else the settlement is (mis)credited to the escrow address, not the donor.
-    /// This holds by construction in slot order — a birth's `create_escrow` is
-    /// always in an earlier slot than its `claim`/`release` — which is exactly the
-    /// order the canonical from-chain recompute (architecture §8) folds in, so the
-    /// recompute is always correct. A live canister that ingests a settlement
-    /// before its birth misattributes *transiently*; the next generation's
-    /// slot-ordered recompute is the source of truth and heals it. We deliberately
-    /// keep the fold order-simple (no reverse index / deferral / re-attribution)
-    /// and lean on that backstop rather than add a mechanism.
+    /// Ordering requirement: an escrow's birth must be folded **before** its
+    /// settlement, else the settlement is credited to the escrow address instead of
+    /// the donor — and that is **permanent**, not transient. The law only adds
+    /// (`crown-reduce`): there is no debit, no re-attribution, and a later birth
+    /// does not reach back. Within this generation the wrong key stands forever.
+    ///
+    /// Only one of the two generation mechanisms (architecture §8) undoes it, and
+    /// it is not the cheap one: a from-chain **recompute** folds in slot order and
+    /// is correct by construction, but a **handoff** *sums* generations, so it
+    /// carries the wrong key forward untouched. Misattribution therefore costs a
+    /// full recompute of chain history — never assume it heals itself.
+    ///
+    /// What actually holds the ordering is the settle path, not slot order. A
+    /// `Settled` whose donor is an escrow can only arise from `claim(settle)`
+    /// (`crown-factory`, form `two-outcome`: `cancel` and `refund` return to the
+    /// donor and reach the splitter not at all), and `claim` demands an ed25519
+    /// verdict signed by the escrow's `resolver`. That signature exists only after
+    /// a game materialized the scope on a **birth proof** — a witness against a
+    /// certified index root, i.e. the birth was already folded here. So the birth
+    /// precedes the settlement because the money cannot move until it does.
+    ///
+    /// Two things this does *not* cover, both deliberate:
+    /// - An escrow whose `resolver` is its creator's own key needs no game and no
+    ///   birth proof; the creator can settle it themselves. That is self-inflicted
+    ///   — their money, and the reputation they lose lands on the escrow PDA, which
+    ///   is off-curve and so can never collide with anyone's wallet.
+    /// - A form whose settle path is *not* signature-gated. Form `stream` is
+    ///   exactly that (`release` is permissionless and schedule-gated), which is
+    ///   why it is not in the mainnet perimeter (`config/mainnet.toml`,
+    ///   `08-deferred.md`). Adding such a form back means this paragraph stops
+    ///   being true and the ordering becomes the pusher's obligation instead.
+    ///
+    /// The fold stays order-simple on purpose: no reverse index, no deferral, no
+    /// re-attribution.
     pub fn attribute(&self, event: Settled) -> Settled {
-        match self.births.get(&event.donor) {
+        match self.birth(&event.donor) {
             Some(b) => Settled {
                 donor: b.donor,
                 ..event
@@ -127,36 +275,24 @@ impl Certified {
         self.applied.contains(signature)
     }
 
-    /// Reserve a signature for an in-flight ingest, *synchronously* before the
-    /// outcall await. `false` (reject) if it is empty, already applied, or already
-    /// reserved — this is the atomic exactly-once guard against concurrent
-    /// same-signature ingests each folding the settlement. Released by
-    /// `mark_applied` (success) or `release` (abort).
-    pub fn reserve(&mut self, signature: &[u8]) -> bool {
-        if signature.is_empty() {
-            return false;
-        }
-        if self.applied.contains(signature) || self.in_flight.contains(signature) {
-            return false;
-        }
-        self.in_flight.insert(signature.to_vec());
-        true
-    }
-
-    /// Drop an in-flight reservation whose ingest aborted (e.g. outcall NotFound),
-    /// so the signature stays retriable.
-    pub fn release(&mut self, signature: &[u8]) {
-        self.in_flight.remove(signature);
-    }
-
-    /// Mark a non-empty signature applied (clearing any in-flight reservation).
-    /// Empty signatures are never marked (exactly-once invariant #1). Returns
-    /// `true` if newly inserted.
+    /// Mark a non-empty signature applied. Empty signatures are never marked
+    /// (exactly-once invariant #1). Returns `true` if newly inserted.
+    ///
+    /// Applied is the *only* terminal state a signature has. There is no attempt
+    /// budget and no poisoning: an unreadable read leaves the signature exactly as
+    /// it found it, so a later ingest — once the transaction is finalized, or once
+    /// the providers agree — still folds it. Bounding retries would bound the
+    /// platform's own wasted spend, but the payer is not always the platform:
+    /// `ingest` is permissionless-once-paid, so anyone may spend the budget of a
+    /// signature they do not own, and a spent budget is refusal *forever* on a
+    /// canister that cannot be patched. The loss it used to bound is bounded
+    /// instead where the payer actually is — the relay's per-key cycle budget
+    /// (`crown-relay/src/admit.rs`, non-negativity invariant #6), which is not
+    /// frozen and can be retuned.
     pub fn mark_applied(&mut self, signature: Vec<u8>) -> bool {
         if signature.is_empty() {
             return false;
         }
-        self.in_flight.remove(&signature);
         self.applied.insert(signature)
     }
 
@@ -173,9 +309,10 @@ impl Certified {
         self.anomalies
     }
 
-    /// Reputation at a key (0 if absent).
+    /// Reputation at a key (0 if absent) — read straight off the certified leaf,
+    /// which is the same value the accompanying witness proves.
     pub fn reputation(&self, chain: ChainId, donor: [u8; 32], recipient: [u8; 32]) -> u128 {
-        self.book.get(&(chain, donor, recipient))
+        leaf_value(self.book_tree.get(&book_key(chain, donor, recipient)))
     }
 
     /// The labeled hash of the book sub-tree — the leaf that `combined_root` and
@@ -305,6 +442,133 @@ mod tests {
     }
 
     #[test]
+    fn births_page_walks_every_birth_exactly_once() {
+        let mut s = Certified::new();
+        for i in 0..10u8 {
+            s.record_birth(
+                [i; 32],
+                Birth {
+                    donor: [i.wrapping_add(100); 32],
+                    slot: u64::from(i),
+                },
+            );
+        }
+
+        // Walk in pages of 3, feeding the last escrow back as the cursor — the
+        // handoff's access pattern.
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = s.births_page(cursor, 3);
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 3, "a page never exceeds its limit");
+            cursor = page.last().map(|(k, _)| *k);
+            seen.extend(page.into_iter().map(|(k, _)| k));
+        }
+
+        // Every birth, once, in key order: a page boundary neither skips nor
+        // repeats — a skipped birth is a permanent misattribution in the successor.
+        assert_eq!(seen.len(), 10);
+        let mut expected: Vec<[u8; 32]> = (0..10u8).map(|i| [i; 32]).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+        assert_eq!(s.births_count(), 10);
+    }
+
+    /// The count is kept, not derived (`RbTree` has no `len`), so re-recording an
+    /// escrow must not inflate it — the gauge it feeds is what schedules the
+    /// cutover, and an over-count would schedule it early on a canister that
+    /// cannot be asked again.
+    #[test]
+    fn re_recording_a_birth_overwrites_without_double_counting() {
+        let mut s = Certified::new();
+        let escrow = [3u8; 32];
+        s.record_birth(
+            escrow,
+            Birth {
+                donor: [1; 32],
+                slot: 10,
+            },
+        );
+        assert_eq!(s.births_count(), 1);
+        // Same escrow again (a re-ingest of the same `create_escrow`).
+        s.record_birth(
+            escrow,
+            Birth {
+                donor: [1; 32],
+                slot: 10,
+            },
+        );
+        assert_eq!(s.births_count(), 1, "one escrow is one birth");
+        assert_eq!(s.births_page(None, 10).len(), 1);
+        // A different escrow does move it.
+        s.record_birth(
+            [4u8; 32],
+            Birth {
+                donor: [2; 32],
+                slot: 11,
+            },
+        );
+        assert_eq!(s.births_count(), 2);
+    }
+
+    /// The birth is read back off the certified leaf — the same bytes the witness
+    /// proves. This is what makes the removed `BTreeMap` redundant rather than
+    /// merely duplicated: there was never a second source of truth to lose.
+    #[test]
+    fn a_birth_reads_back_from_the_certified_leaf() {
+        let mut s = Certified::new();
+        let b = Birth {
+            donor: [8; 32],
+            slot: 4_242,
+        };
+        s.record_birth([6u8; 32], b);
+        assert_eq!(s.birth(&[6u8; 32]), Some(b));
+        assert_eq!(s.birth(&[7u8; 32]), None);
+    }
+
+    #[test]
+    fn births_page_carries_the_donor_the_successor_needs() {
+        let mut s = Certified::new();
+        s.record_birth(
+            [4; 32],
+            Birth {
+                donor: [7; 32],
+                slot: 99,
+            },
+        );
+        let page = s.births_page(None, 10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, [4u8; 32]);
+        // Donor and slot survive the page — the seed is exactly what `attribute`
+        // reads, so a seeded successor attributes an escrow born before it.
+        assert_eq!(page[0].1.donor, [7u8; 32]);
+        assert_eq!(page[0].1.slot, 99);
+    }
+
+    /// Past the cutover the transaction is readable, simply not ours: the ingest
+    /// touches no state at all, so the signature stays free and the successor
+    /// generation is free to fold it.
+    #[test]
+    fn a_signature_past_the_cutover_is_left_untouched() {
+        let s = Certified::new();
+        assert!(!s.is_applied(b"sigC"));
+    }
+
+    #[test]
+    fn book_keys_counts_distinct_keys_not_settlements() {
+        let mut s = Certified::new();
+        assert_eq!(s.book_keys(), 0);
+        s.apply_settlement(settled(1, 1, 2, 100)).unwrap();
+        s.apply_settlement(settled(1, 1, 2, 50)).unwrap(); // same key accumulates
+        assert_eq!(s.book_keys(), 1, "the gauge measures stored keys");
+        s.apply_settlement(settled(1, 3, 4, 7)).unwrap();
+        assert_eq!(s.book_keys(), 2);
+    }
+
+    #[test]
     fn attribution_credits_the_escrow_donor() {
         let mut s = Certified::new();
         let escrow = [5u8; 32];
@@ -350,30 +614,36 @@ mod tests {
         assert_eq!(s.applied_count(), 1);
     }
 
+    /// Exactly-once rests on `applied` and on nothing else: whichever ingest of a
+    /// signature reaches the fold first marks it, and every later one — however it
+    /// raced — is refused. This is the property the removed reservation was
+    /// *believed* to provide and never did (`state::apply`).
     #[test]
-    fn reservation_dedups_concurrent_ingests() {
+    fn the_applied_set_is_the_whole_of_exactly_once() {
         let mut s = Certified::new();
-        // First reservation of a fresh signature succeeds.
-        assert!(s.reserve(b"sigA"));
-        // A concurrent sibling (before the first marks applied) is rejected.
-        assert!(!s.reserve(b"sigA"));
-        // Empty signatures are never reserved.
-        assert!(!s.reserve(b""));
-        // Completing the ingest marks it applied and clears the reservation.
-        assert!(s.mark_applied(b"sigA".to_vec()));
+        assert!(s.mark_applied(b"sigA".to_vec())); // the winner folds
+        assert!(!s.mark_applied(b"sigA".to_vec())); // every sibling is refused
+        assert!(!s.mark_applied(b"sigA".to_vec()));
         assert!(s.is_applied(b"sigA"));
-        // An already-applied signature cannot be reserved again.
-        assert!(!s.reserve(b"sigA"));
+        assert_eq!(s.applied_count(), 1, "one fold, however many callers raced");
     }
 
+    /// An unreadable ingest leaves the signature exactly as it found it, however
+    /// many times it fails. This is the property that makes the book
+    /// uncensorable: a signature nobody could read yet — because it is not
+    /// finalized, or because the providers had not caught up — is still foldable
+    /// by the next caller. Bounding it would let anyone retire a signature they
+    /// do not own, permanently, on a canister nobody can patch.
     #[test]
-    fn release_keeps_an_aborted_signature_retriable() {
+    fn a_signature_that_could_not_be_read_stays_foldable_forever() {
         let mut s = Certified::new();
-        assert!(s.reserve(b"sigB"));
-        // Abort (e.g. outcall NotFound) releases the reservation.
-        s.release(b"sigB");
-        // Not applied, and reservable again.
+        // No amount of failed reads is recorded anywhere: `applied` is the only
+        // terminal state, and only a real fold sets it.
         assert!(!s.is_applied(b"sigB"));
-        assert!(s.reserve(b"sigB"));
+        assert_eq!(s.applied_count(), 0);
+        // The read finally lands — the signature folds normally.
+        assert!(s.mark_applied(b"sigB".to_vec()));
+        assert!(s.is_applied(b"sigB"));
+        assert_eq!(s.applied_count(), 1);
     }
 }

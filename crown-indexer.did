@@ -1,17 +1,47 @@
-// A recorded escrow birth, for `get_birth`.
+// One enumerated birth, for the successor generation's seed (`get_births_page`).
+type BirthEntry = record { slot : nat64; escrow : blob; donor : blob };
+// A recorded escrow birth, for `get_birth`. `gross` is not surfaced: the index
+// stores only `donor`/`slot` (a game's address derivation already commits `gross`).
 type BirthView = record { slot : nat64; donor : blob };
 // Outcome of a paid `ingest`.
 type IngestResult = variant {
   // Canister balance below `CYCLE_FLOOR` — refused to touch the reserve.
   LowBalance;
-  // Folded in: counts of settlements, births, and cross-check anomalies.
+  // Folded in: counts of settlements, births, and cross-check anomalies. All
+  // zero when the transaction was read fine but held nothing this index
+  // recognizes — including a *reverted* one, which is retired here rather than
+  // retried, since a finalized failure is permanent.
   Applied : record { settlements : nat64; anomalies : nat64; births : nat64 };
   // Attached cycles below `INGEST_PRICE` — rejected before any work.
   Underpaid;
-  // Signature already folded in, or an identical ingest is in flight — no charge, no outcall.
+  // Signature already folded in — no charge, no outcall. Also the answer when a
+  // concurrent ingest of the same signature reached the fold first: nothing is
+  // reserved ahead of the outcall, so the loser of that race pays for its own
+  // duplicate (`00 §3.2`) and the book still sees exactly one fold.
   Duplicate;
-  // No finalized transaction under consensus, or it failed / was unreadable.
+  // No finalized transaction under consensus, or the reply could not be read.
+  // The payment is kept — `fund-then-fail` must not be cheaper than the work it
+  // triggers (`01-standards §Тесты 4`) — but the signature itself is left
+  // untouched and stays foldable by anyone, forever. That matters: a
+  // not-yet-finalized transaction is indistinguishable here from an unreadable
+  // one, so a signature retired on failed reads could be retired by an adversary
+  // who submits it *before* finality, for the price of the reads. A transaction
+  // that was read and simply reverted is not this: it is `Applied` with zero
+  // counts.
   NotFound;
+  // The transaction sits at or past `CUTOVER_SLOT` — it belongs to the next
+  // generation's book, not this one's (architecture §8). Not an error and not
+  // retriable here: the payment is kept (the outcall was made), but the
+  // signature is left untouched for the successor to fold.
+  AfterCutover;
+};
+// The capacity gauge (`get_state_stats`). All state is heap-resident and the
+// book only grows, so these numbers are what says how much of this generation
+// is left.
+type StateStats = record {
+  book_keys : nat64;
+  heap_bytes : nat64;
+  births : nat64;
 };
 service : () -> {
   // Count of cross-check anomalies (event vs executed transfer). Free query.
@@ -20,6 +50,17 @@ service : () -> {
   get_applied_count : () -> (nat64) query;
   // A birth (if recorded) plus a witness reconstructing to the combined root.
   get_birth : (blob) -> (opt BirthView, blob) query;
+  // One page of recorded births in escrow order, starting strictly after
+  // `start_after`. `None` means the cursor was not a 32-byte address; an empty
+  // vector means the walk is done. The two are told apart deliberately — a
+  // malformed cursor answered with "empty" would read as "done" and silently
+  // truncate the successor's seed, which is exactly the misattribution this query
+  // exists to prevent.
+  // 
+  // Sole consumer: the generational handoff (architecture §8). Free query, so the
+  // seed costs nothing; it is auditable after the fact, since every entry can be
+  // re-checked against this canister's certificate via `get_birth`.
+  get_births_page : (opt blob, nat32) -> (opt vec BirthEntry) query;
   // The IC certificate (signed by the NNS root key) over the canister's certified
   // data, plus the combined root it commits to. A witness verifies against this.
   get_certificate : () -> (opt blob, blob) query;
@@ -29,6 +70,16 @@ service : () -> {
   // reconstructs to the combined root. Verify it with `get_certificate` against
   // the NNS root key. Free query. Empty witness on a malformed (non-32B) key.
   get_reputation : (blob, blob, blob) -> (nat, blob) query;
+  // The capacity gauge: heap bytes, book keys, births.
+  // Free query.
+  // 
+  // The one reading that says how much of this generation is left. State is
+  // heap-only and the book is monotone by law (§2), so the heap figure only ever
+  // rises; when it reaches the canister's memory limit every ingest traps and the
+  // book stops permanently. Blackholed means that limit cannot be raised and this
+  // query cannot be added later — so the cutover is planned off these numbers, or
+  // it is not planned at all.
+  get_state_stats : () -> (StateStats) query;
   // The single non-`query`: paid ingest of one Solana signature. Order (spec
   // §Поверхность): `is_applied` → attached ≥ `INGEST_PRICE` → balance ≥
   // `CYCLE_FLOOR` → **accept cycles** → outcall. No outcall or write before

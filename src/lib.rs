@@ -5,6 +5,22 @@
 //! The single non-`query` is the paid `ingest`: gate (no work before payment) →
 //! accept cycles → `getTransaction` outcall → recognize → fold → re-certify.
 //! `unwrap`/`expect`/`panic` are barred on the ingest path.
+#![forbid(unsafe_code)]
+// The ban is a crate lint, not a habit. This canister is blackholed: a panic on
+// the ingest path is a trap that cannot be patched out, and an unmarked overflow
+// is a wrong book that cannot be corrected. `crown-reduce` already denies these;
+// the index is the half that actually touches untrusted chain bytes, so it must
+// too. Tests are exempt — `unwrap` in a test *is* the assertion.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
+    )
+)]
 
 use candid::{CandidType, Deserialize, Nat};
 use crown_reduce::ChainId;
@@ -29,22 +45,62 @@ const MAX_SIGNATURE_LEN: usize = 88;
 /// Outcome of a paid `ingest`.
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub enum IngestResult {
-    /// Folded in: counts of settlements, births, and cross-check anomalies.
+    /// Folded in: counts of settlements, births, and cross-check anomalies. All
+    /// zero when the transaction was read fine but held nothing this index
+    /// recognizes — including a *reverted* one, which is retired here rather than
+    /// retried, since a finalized failure is permanent.
     Applied {
         settlements: u64,
         births: u64,
         anomalies: u64,
     },
-    /// Signature already folded in, or an identical ingest is in flight — no
-    /// charge, no outcall.
+    /// Signature already folded in — no charge, no outcall. Also the answer when
+    /// a concurrent ingest of the same signature reached the fold first: nothing
+    /// is reserved ahead of the outcall, so the loser of that race pays for its
+    /// own duplicate (`00 §3.2`) and the book still sees exactly one fold.
     Duplicate,
     /// Attached cycles below `INGEST_PRICE` — rejected before any work.
     Underpaid,
     /// Canister balance below `CYCLE_FLOOR` — refused to touch the reserve.
     LowBalance,
-    /// No finalized transaction under consensus, or it failed / was unreadable.
+    /// No finalized transaction under consensus, or the reply could not be read.
+    /// The payment is kept — `fund-then-fail` must not be cheaper than the work
+    /// it triggers (`01-standards §Тесты 4`) — but the signature itself is left
+    /// untouched and stays foldable by anyone, forever. That matters: a
+    /// not-yet-finalized transaction is indistinguishable here from an unreadable
+    /// one, so a signature retired on failed reads could be retired by an
+    /// adversary who submits it *before* finality, for the price of the reads.
+    /// A transaction that was read and simply reverted is not this: it is
+    /// `Applied` with zero counts.
     NotFound,
+    /// The transaction sits at or past `CUTOVER_SLOT` — it belongs to the next
+    /// generation's book, not this one's (architecture §8). Not an error and not
+    /// retriable here: the payment is kept (the outcall was made), but the
+    /// signature stays free for the successor to fold.
+    AfterCutover,
 }
+
+/// One enumerated birth, for the successor generation's seed (`get_births_page`).
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct BirthEntry {
+    pub escrow: Vec<u8>,
+    pub donor: Vec<u8>,
+    pub slot: u64,
+}
+
+/// The capacity gauge (`get_state_stats`). All state is heap-resident and the
+/// book only grows, so these numbers are what says how much of this generation
+/// is left — plus the one reading that exposes a wedged reservation.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct StateStats {
+    pub heap_bytes: u64,
+    pub book_keys: u64,
+    pub births: u64,
+}
+
+/// Largest `get_births_page` reply. Sized so a full page stays well inside the
+/// query response limit (~80 B per entry on the wire → under 1 MiB).
+const MAX_BIRTHS_PAGE: usize = 10_000;
 
 /// A recorded escrow birth, for `get_birth`. `gross` is not surfaced: the index
 /// stores only `donor`/`slot` (a game's address derivation already commits `gross`).
@@ -70,18 +126,40 @@ fn init() {
     state::recertify();
 }
 
-/// Drop unpaid ingress before it induces any work. `ingest` is the only update
-/// and it is paid — but ingress messages can never attach cycles, so a direct
-/// user `ingest` is always `Underpaid` yet would still decode the (up to ~2 MB)
-/// argument and run the gate for free. The relay reaches `ingest` via an
-/// inter-canister call, which bypasses `inspect_message`, so the paid path is
-/// unaffected. Any other ingress (none today) is accepted.
+/// Re-publish the combined root after an upgrade. State is heap-only, so an
+/// upgrade empties the book — but `certified_data` survives it, so without this
+/// the canister would keep serving the *pre-upgrade* root while every witness
+/// reconstructs to the empty one, and every certified read would fail
+/// verification until the first ingest happened to land.
+///
+/// Mainnet is blackholed and never upgrades; devnet and testnet do, and a hook
+/// that must exist before the freeze cannot be added after it.
+#[ic_cdk::post_upgrade]
+fn post_upgrade() {
+    state::recertify();
+}
+
+/// Drop *every* ingress message. Nothing here is reachable by ingress by design,
+/// so the boundary admits nothing — `accept_message` is never called.
+///
+/// Two paths are affected, and both must be closed. `ingest` is paid, but ingress
+/// can never attach cycles, so a direct user `ingest` is always `Underpaid` while
+/// still costing a decode of the (up to ~2 MB) argument. And every `query` here
+/// can also be called as a *replicated* update, which the canister then executes
+/// and pays for out of its own balance: ~6.5M cycles for the cheapest counter,
+/// far more for a full `get_births_page`. Nothing gates that — the ingest gate
+/// only sees `ingest` — so an anonymous caller could burn the balance down to
+/// `CYCLE_FLOOR`, after which every paid ingest answers `LowBalance` and the book
+/// stops for good. On a blackholed canister that is unfixable, so the boundary
+/// fails closed: the exported hook itself is what refuses, since a canister with
+/// no `inspect_message` accepts all ingress by default.
+///
+/// The paid path is unaffected: the relay reaches `ingest` by inter-canister
+/// call, which is not inspected. Queries reached as queries are also not
+/// inspected — free reads stay free.
 #[ic_cdk::inspect_message]
 fn inspect_message() {
-    if ic_cdk::api::msg_method_name() == "ingest" {
-        return; // no accept_message → the unpaid ingress is dropped
-    }
-    ic_cdk::api::accept_message();
+    // No `accept_message()`, on any method: every ingress message is dropped.
 }
 
 /// The single non-`query`: paid ingest of one Solana signature. Order (spec
@@ -111,32 +189,72 @@ async fn ingest(signature: String) -> IngestResult {
         Gate::Proceed => {}
     }
 
-    // Reserve the signature *before* the outcall await. The exactly-once mark
-    // (`apply`) only lands after the await, so without this reservation N
-    // concurrent ingests of the same signature would each pass the gate and fold
-    // the settlement N times, inflating reputation. A failed reservation means a
-    // duplicate or an in-flight sibling — free, no charge. (Empty signatures are
-    // never productive and are rejected here too.)
-    if !state::reserve(&sig_bytes) {
-        return IngestResult::Duplicate;
+    // An empty signature can never resolve to a transaction and is never marked
+    // applied (invariant #1), so it would retry forever at full price. Free.
+    if sig_bytes.is_empty() {
+        return IngestResult::NotFound;
     }
+
+    // Nothing is reserved ahead of the outcall, deliberately. Exactly-once is
+    // `apply`'s synchronous `is_applied` check, not a reservation: N concurrent
+    // ingests of one signature all fetch, and exactly one folds. A reservation
+    // would save the losers an outcall each — work their own submitter paid for
+    // (`00 §3.2`) — at the price of state committed before an `await`, which a
+    // trapped callback rolls back *around*: the signature would then read as
+    // "in flight" forever, indistinguishable from "already folded", on a canister
+    // that cannot be patched. Cheap to add later; impossible to remove later.
 
     // Payment accepted before any outcall.
     ic_cdk::api::msg_cycles_accept(config::INGEST_PRICE);
 
+    // A failed read keeps the payment (`01-standards §Тесты 4`) and changes no
+    // state: the signature stays foldable by anyone. Retrying is the submitter's
+    // own cost to bound (contract of the pusher, `07-build-plan.md`), and the
+    // platform's own retries are bounded where its money actually leaves — the
+    // relay's per-key cycle budget.
     let Some(reply) = rpc::fetch(signature).await else {
-        state::release(&sig_bytes); // keep the signature retriable
         return IngestResult::NotFound;
     };
-    let Some(tx) = parse::parse(&reply) else {
-        state::release(&sig_bytes); // failed / unreadable transaction — retriable
-        return IngestResult::NotFound;
-    };
-    let a = state::apply(sig_bytes, &tx);
-    IngestResult::Applied {
-        settlements: a.settlements,
-        births: a.births,
-        anomalies: a.anomalies,
+    // Generation boundary (architecture §8). Generations are *summed*, not
+    // replaced, so a settlement folded by both would double the reputation it
+    // proves for the price of one ingest. Refusing past the boundary is what makes
+    // the two books disjoint, and it must be enforced here rather than trusted to
+    // the pusher: `ingest` is permissionless-once-paid, so "nobody submits old
+    // slots to the old canister" is a convention an adversary is free to break.
+    // No attempt is spent — the transaction is perfectly readable, it is simply
+    // not ours, and the signature must stay untouched for the successor to fold.
+    // Decided off the reply's own slot, before parsing: the boundary is about
+    // whose mandate the transaction is, which does not depend on reading it.
+    if config::CUTOVER_SLOT.is_some_and(|cutover| reply.slot >= cutover) {
+        return IngestResult::AfterCutover;
+    }
+    match parse::parse(&reply) {
+        Some(parse::Parsed::Executed(tx)) => match state::apply(sig_bytes, &tx) {
+            Some(a) => IngestResult::Applied {
+                settlements: a.settlements,
+                births: a.births,
+                anomalies: a.anomalies,
+            },
+            // Already applied — a concurrent ingest of the same signature got
+            // there first. Above all: not folded twice.
+            None => IngestResult::Duplicate,
+        },
+        // Read fine; the chain says it reverted. Finalized and permanent, so it is
+        // retired rather than left retriable: nothing is wrong with the read, and
+        // a pusher that could not tell the two apart would re-fetch it forever at
+        // full price.
+        Some(parse::Parsed::Reverted) => {
+            if state::retire(sig_bytes) {
+                IngestResult::Applied {
+                    settlements: 0,
+                    births: 0,
+                    anomalies: 0,
+                }
+            } else {
+                IngestResult::Duplicate
+            }
+        }
+        None => IngestResult::NotFound,
     }
 }
 
@@ -189,6 +307,55 @@ fn get_applied_count() -> u64 {
 #[ic_cdk::query]
 fn get_anomaly_count() -> u64 {
     state::anomaly_count()
+}
+
+/// One page of recorded births in escrow order, starting strictly after
+/// `start_after`. `None` means the cursor was not a 32-byte address; an empty
+/// vector means the walk is done. The two are told apart deliberately — a
+/// malformed cursor answered with "empty" would read as "done" and silently
+/// truncate the successor's seed, which is exactly the misattribution this query
+/// exists to prevent.
+///
+/// Sole consumer: the generational handoff (architecture §8). Free query, so the
+/// seed costs nothing; it is auditable after the fact, since every entry can be
+/// re-checked against this canister's certificate via `get_birth`.
+#[ic_cdk::query]
+fn get_births_page(start_after: Option<Vec<u8>>, limit: u32) -> Option<Vec<BirthEntry>> {
+    let cursor = match start_after {
+        Some(v) => Some(to32(v)?),
+        None => None,
+    };
+    // Clamped to at least one so a zero `limit` cannot answer "empty" forever and
+    // stall the walk short of the end.
+    let limit = (limit as usize).clamp(1, MAX_BIRTHS_PAGE);
+    Some(
+        state::births_page(cursor, limit)
+            .into_iter()
+            .map(|(escrow, b)| BirthEntry {
+                escrow: escrow.to_vec(),
+                donor: b.donor.to_vec(),
+                slot: b.slot,
+            })
+            .collect(),
+    )
+}
+
+/// The capacity gauge: heap bytes, book keys, births. Free query.
+///
+/// The one reading that says how much of this generation is left. State is
+/// heap-only and the book is monotone by law (§2), so the heap figure only ever
+/// rises; when it reaches the canister's memory limit every ingest traps and the
+/// book stops permanently. Blackholed means that limit cannot be raised and this
+/// query cannot be added later — so the cutover is planned off these numbers, or
+/// it is not planned at all.
+#[ic_cdk::query]
+fn get_state_stats() -> StateStats {
+    let (heap_bytes, book_keys, births) = state::state_stats();
+    StateStats {
+        heap_bytes,
+        book_keys,
+        births,
+    }
 }
 
 /// A 32-byte address from a blob argument, or `None` on wrong length.

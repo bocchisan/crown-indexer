@@ -8,8 +8,10 @@
 //! indices to pubkeys so `recognize` sees real programs and accounts.
 //!
 //! Pure and panic-free (it runs after payment, on the ingest path): every read
-//! is bounds-checked, every offset is `checked_*`. A malformed or failed
-//! transaction yields `None` — never a partial fold.
+//! is bounds-checked, every offset is `checked_*`. A malformed transaction
+//! yields `None` — never a partial fold. A *reverted* one is told apart from an
+//! unreadable one (`Parsed`): the first is a permanent fact about the chain, the
+//! second a transient fact about our read, and only the second deserves a retry.
 
 use crate::recognize::{Instr, Tx};
 use candid::{CandidType, Deserialize, Reserved};
@@ -114,12 +116,31 @@ pub fn pick_consistent(result: MultiGetTransactionResult) -> Option<TransactionR
     }
 }
 
-/// Map a reply to the recognition view, or `None` if it failed / can't be read.
-pub fn parse(reply: &TransactionReply) -> Option<Tx> {
+/// What a readable `getTransaction` reply amounts to.
+///
+/// The two arms are the whole reason this is not an `Option`: a reverted
+/// transaction is a *permanent* fact about the chain — it is finalized, it moved
+/// nothing, and no retry will ever change that — whereas an unreadable reply
+/// (`None` from `parse`) is a fact about *our read* and may well succeed next
+/// time. Collapsing them would leave a perfectly readable non-event retriable
+/// forever, so a pusher that cannot tell the two apart re-fetches it at full
+/// price until it gives up.
+#[derive(Clone, Debug)]
+pub enum Parsed {
+    /// A successful transaction, in the recognition view.
+    Executed(Tx),
+    /// The chain says this transaction executed and reverted.
+    Reverted,
+}
+
+/// Map a reply to the recognition view. `None` only if the reply could not be
+/// read at all — a reverted transaction is `Parsed::Reverted`, not a failure.
+pub fn parse(reply: &TransactionReply) -> Option<Parsed> {
     let meta = reply.transaction.meta.as_ref()?;
-    // A failed transaction reverted — no tokens moved, nothing to recognize.
+    // A failed transaction reverted — no tokens moved, nothing to recognize, and
+    // (being finalized) nothing ever will. Terminal, not retriable.
     if !matches!(meta.status, TxStatus::Ok) {
-        return None;
+        return Some(Parsed::Reverted);
     }
 
     let raw = decode_binary(&reply.transaction.transaction)?;
@@ -144,10 +165,10 @@ pub fn parse(reply: &TransactionReply) -> Option<Tx> {
             }
         }
     }
-    Some(Tx {
+    Some(Parsed::Executed(Tx {
         instrs,
         slot: reply.slot,
-    })
+    }))
 }
 
 /// Resolve a compiled instruction's program/account indices to pubkeys.
@@ -326,6 +347,14 @@ mod tests {
         }
     }
 
+    /// The executed transaction of a reply, for the tests that expect one.
+    fn executed(r: &TransactionReply) -> Tx {
+        match parse(r) {
+            Some(Parsed::Executed(tx)) => tx,
+            other => panic!("expected an executed transaction, got {other:?}"),
+        }
+    }
+
     fn ok_meta(inner: Option<Vec<InnerInstructions>>) -> TxMeta {
         TxMeta {
             status: TxStatus::Ok,
@@ -354,7 +383,7 @@ mod tests {
         let msg = SolMessage::new(&[ix_a, ix_b], Some(&payer));
 
         let r = reply(&msg, Some(ok_meta(None)), 42);
-        let tx = parse(&r).expect("parses");
+        let tx = executed(&r);
         assert_eq!(tx.slot, 42);
         assert_eq!(tx.instrs.len(), 2);
 
@@ -396,15 +425,18 @@ mod tests {
             })],
         }];
 
-        let tx = parse(&reply(&msg, Some(ok_meta(Some(inner))), 1)).expect("parses");
+        let tx = executed(&reply(&msg, Some(ok_meta(Some(inner))), 1));
         assert_eq!(tx.instrs.len(), 2); // 1 top-level + 1 inner
         assert_eq!(tx.instrs[1].program, prog.to_bytes());
         assert_eq!(tx.instrs[1].accounts, vec![payer.to_bytes()]);
         assert_eq!(tx.instrs[1].data, vec![7, 7]);
     }
 
+    /// A finalized *reverted* transaction is read perfectly well — it simply moved
+    /// nothing. It must come back as `Reverted` (terminal, retire the signature),
+    /// never as `None` (unreadable, leave the signature foldable and retriable).
     #[test]
-    fn a_failed_transaction_is_not_parsed() {
+    fn a_reverted_transaction_is_terminal_not_unreadable() {
         let payer = Pubkey::new_unique();
         let msg = SolMessage::new(
             &[SolIx::new_with_bytes(
@@ -419,7 +451,14 @@ mod tests {
             inner_instructions: None,
             loaded_addresses: None,
         };
-        assert!(parse(&reply(&msg, Some(meta), 1)).is_none());
+        assert!(matches!(
+            parse(&reply(&msg, Some(meta), 1)),
+            Some(Parsed::Reverted)
+        ));
+
+        // Absent meta *is* an unreadable reply: without it the status is unknown,
+        // so this one is a failed read and does deserve its retry.
+        assert!(parse(&reply(&msg, None, 1)).is_none());
     }
 
     #[test]
@@ -432,7 +471,7 @@ mod tests {
         let mut metas = vec![AccountMeta::new(payer, true)];
         metas.extend(extras.iter().map(|k| AccountMeta::new_readonly(*k, false)));
         let msg = SolMessage::new(&[SolIx::new_with_bytes(prog, &[5], metas)], Some(&payer));
-        let tx = parse(&reply(&msg, Some(ok_meta(None)), 1)).expect("parses");
+        let tx = executed(&reply(&msg, Some(ok_meta(None)), 1));
         assert_eq!(tx.instrs.len(), 1);
         assert_eq!(tx.instrs[0].accounts.len(), 201);
         assert_eq!(tx.instrs[0].accounts[0], payer.to_bytes());
@@ -551,6 +590,9 @@ mod tests {
         block_time: Option<i64>, // unmodeled
         transaction: WTxMeta,
     }
+    // Boxing the large variant would change the candid this encodes, and it is a
+    // byte-shape mirror of the SOL RPC reply — its layout is the point.
+    #[allow(clippy::large_enum_variant)]
     #[derive(CandidType, Deserialize)]
     enum WGetRes {
         Ok(Option<WReply>),

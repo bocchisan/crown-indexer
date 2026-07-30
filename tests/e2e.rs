@@ -8,14 +8,17 @@
 //! Run with the bundled server:
 //!   POCKET_IC_BIN=~/.cache/dfinity/versions/<v>/pocket-ic cargo test --test e2e
 
-use candid::{Decode, Encode, Nat, Principal};
+use candid::{Decode, Encode, Nat, Principal, Reserved};
 use crown_indexer::config;
 use crown_indexer::parse::{
     EncodedTransaction, EncodedTxWithMeta, Encoding, GetTransactionResult,
     MultiGetTransactionResult, TransactionReply, TxMeta, TxStatus,
 };
-use crown_indexer::IngestResult;
+use crown_indexer::{IngestResult, StateStats};
 use pocket_ic::{PocketIc, PocketIcBuilder};
+use solana_program::instruction::{AccountMeta, Instruction as SolIx};
+use solana_program::message::Message as SolMessage;
+use solana_program::pubkey::Pubkey;
 
 const T_CYCLES: u128 = 4_000_000_000_000;
 
@@ -27,21 +30,39 @@ const TOKEN_PROGRAM: [u8; 32] = [
 const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
 fn indexer_wasm() -> Vec<u8> {
-    let path = "target/wasm32-unknown-unknown/release/crown_indexer.wasm";
-    if !std::path::Path::new(path).exists() {
-        let status = std::process::Command::new("cargo")
-            .args([
-                "build",
-                "--lib",
-                "--release",
-                "--target",
-                "wasm32-unknown-unknown",
-            ])
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "failed to build the indexer wasm");
-    }
-    std::fs::read(path).expect("read indexer wasm")
+    build_indexer_wasm("testnet", "target")
+}
+
+/// The indexer wasm for a config profile, built into its own target directory so
+/// two profiles never invalidate each other's artifacts.
+fn build_indexer_wasm(profile: &str, target_dir: &str) -> Vec<u8> {
+    let path = format!("{target_dir}/wasm32-unknown-unknown/release/crown_indexer.wasm");
+    // Always invoke cargo — never "skip if the file exists". The profile's
+    // addresses are baked into the wasm by `build.rs`, so a cached artifact is a
+    // *different program* from the one the test host is asserting about. Skipping
+    // the build meant an edited `config/*.toml` was silently never picked up, and
+    // the suite tested last week's bytecode; the failure that exposed this looked
+    // like a broken assertion, but a smaller edit would have passed just as
+    // silently. Cargo is incremental, so an unchanged tree costs a fraction of a
+    // second here.
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--lib",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--target-dir",
+            target_dir,
+        ])
+        .env("CROWN_PROFILE", profile)
+        .status()
+        .expect("cargo build");
+    assert!(
+        status.success(),
+        "failed to build the {profile} indexer wasm"
+    );
+    std::fs::read(&path).expect("read indexer wasm")
 }
 
 fn setup() -> (PocketIc, Principal) {
@@ -94,6 +115,48 @@ fn unpaid_ingest_is_rejected_before_any_outcall() {
     .unwrap();
     assert_eq!(applied, 0);
     assert_eq!(anomalies, 0);
+}
+
+/// The boundary is fail-*closed*: it admits no ingress at all, not merely
+/// `ingest`.
+///
+/// Every `query` here can also be addressed as a *replicated* update, which the
+/// canister then executes and pays for out of its own balance — and no gate sees
+/// those, since the ingest gate only runs inside `ingest`. Left open, an
+/// anonymous caller could burn the balance down to `CYCLE_FLOOR`, after which
+/// every paid ingest answers `LowBalance` and the book stops for good. On a
+/// blackholed canister that is unfixable, so it must not be reachable at all.
+#[test]
+fn every_ingress_is_dropped_at_the_boundary_and_costs_nothing() {
+    let (pic, id) = setup();
+    let before = pic.cycle_balance(id);
+
+    // The cheapest and the most expensive query, each addressed as a replicated
+    // update. Both must be refused at the boundary, before execution.
+    for (method, args) in [
+        ("get_applied_count", Encode!().unwrap()),
+        ("get_state_stats", Encode!().unwrap()),
+        (
+            "get_births_page",
+            Encode!(&None::<Vec<u8>>, &10_000u32).unwrap(),
+        ),
+    ] {
+        let res = pic.update_call(id, Principal::anonymous(), method, args);
+        assert!(
+            res.is_err(),
+            "`{method}` as a replicated update must be dropped at the boundary, got {res:?}"
+        );
+    }
+
+    assert_eq!(
+        pic.cycle_balance(id),
+        before,
+        "a message refused at the boundary must not cost the canister a cycle"
+    );
+
+    // Free reads are untouched: queries reached *as queries* are not inspected.
+    let stats = query(&pic, id, "get_applied_count", Encode!().unwrap());
+    assert_eq!(Decode!(&stats, u64).unwrap(), 0);
 }
 
 #[test]
@@ -175,6 +238,10 @@ fn mock_wasm() -> Vec<u8> {
 /// principal (`tghme-…`) on the fiduciary subnet, so the indexer reaches it by
 /// the same address it uses on mainnet.
 fn setup_with_mock() -> (PocketIc, Principal, Principal) {
+    setup_with_mock_wasm(indexer_wasm())
+}
+
+fn setup_with_mock_wasm(wasm: Vec<u8>) -> (PocketIc, Principal, Principal) {
     let pic = PocketIcBuilder::new()
         .with_nns_subnet()
         .with_fiduciary_subnet()
@@ -183,7 +250,7 @@ fn setup_with_mock() -> (PocketIc, Principal, Principal) {
     let app = pic.topology().get_app_subnets()[0];
     let indexer = pic.create_canister_on_subnet(None, None, app);
     pic.add_cycles(indexer, T_CYCLES);
-    pic.install_canister(indexer, indexer_wasm(), Encode!().unwrap(), None);
+    pic.install_canister(indexer, wasm, Encode!().unwrap(), None);
 
     let sol_rpc = Principal::from_text("tghme-zyaaa-aaaar-qarca-cai").unwrap();
     let mock = pic
@@ -202,49 +269,72 @@ fn settled_discriminator() -> [u8; 8] {
     full[..8].try_into().unwrap()
 }
 
-/// A canned `getTransaction` reply carrying a direct-donation `Settled` from the
-/// pinned splitter plus its matching `TransferChecked` (mint = the baked USDC).
-fn canned_response(donor: [u8; 32], recipient: [u8; 32], gross: u64, slot: u64) -> Vec<u8> {
-    use solana_program::instruction::{AccountMeta, Instruction as SolIx};
-    use solana_program::message::Message as SolMessage;
-    use solana_program::pubkey::Pubkey;
+fn create_escrow_discriminator() -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"global:create_escrow");
+    let full: [u8; 32] = h.finalize().into();
+    full[..8].try_into().unwrap()
+}
 
-    let donor_pk = Pubkey::new_from_array(donor);
-    let mint_pk = Pubkey::new_from_array(config::USDC); // baked (placeholder [0;32])
-    let token_pk = Pubkey::new_from_array(TOKEN_PROGRAM);
-    let splitter_pk = Pubkey::new_from_array(config::SPLITTER);
-    let source = Pubkey::new_unique();
-    let dest = Pubkey::new_unique();
-
-    // TransferChecked: accounts [source, mint, dest, authority].
-    let mut transfer_data = vec![12u8];
-    transfer_data.extend_from_slice(&gross.to_le_bytes());
-    transfer_data.push(6);
-    let transfer_ix = SolIx {
-        program_id: token_pk,
+/// SPL `TransferChecked`, accounts `[source, mint, dest, authority]`.
+fn transfer_ix(amount: u64, authority: Pubkey) -> SolIx {
+    let mut data = vec![12u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(6); // decimals
+    SolIx {
+        program_id: Pubkey::new_from_array(TOKEN_PROGRAM),
         accounts: vec![
-            AccountMeta::new(source, false),
-            AccountMeta::new_readonly(mint_pk, false),
-            AccountMeta::new(dest, false),
-            AccountMeta::new_readonly(donor_pk, true),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(config::USDC), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(authority, true),
         ],
-        data: transfer_data,
-    };
+        data,
+    }
+}
 
-    // Settled event-CPI (tag ‖ disc ‖ donor ‖ recipient ‖ gross).
-    let mut settled_data = Vec::new();
-    settled_data.extend_from_slice(&EVENT_IX_TAG);
-    settled_data.extend_from_slice(&settled_discriminator());
-    settled_data.extend_from_slice(&donor);
-    settled_data.extend_from_slice(&recipient);
-    settled_data.extend_from_slice(&gross.to_le_bytes());
-    let settled_ix = SolIx {
-        program_id: splitter_pk,
+/// A `Settled` event-CPI from the pinned splitter: tag ‖ disc ‖ borsh fields.
+fn settled_ix(donor: [u8; 32], recipient: [u8; 32], gross: u64) -> SolIx {
+    let mut data = Vec::new();
+    data.extend_from_slice(&EVENT_IX_TAG);
+    data.extend_from_slice(&settled_discriminator());
+    data.extend_from_slice(&donor);
+    data.extend_from_slice(&recipient);
+    data.extend_from_slice(&gross.to_le_bytes());
+    SolIx {
+        program_id: Pubkey::new_from_array(config::SPLITTER),
         accounts: vec![],
-        data: settled_data,
-    };
+        data,
+    }
+}
 
-    let msg = SolMessage::new(&[transfer_ix, settled_ix], Some(&donor_pk));
+/// A `create_escrow` of the first pinned factory, with the escrow account set to
+/// the PDA that factory really derives for `salt`.
+fn create_escrow_ix(donor: Pubkey, salt: [u8; 32]) -> (SolIx, [u8; 32]) {
+    let factory = config::FACTORIES[0];
+    let (escrow, _bump) =
+        crown_derive::solana_pda_address(factory, &[b"escrow", &salt]).expect("derive escrow PDA");
+    let mut data = Vec::new();
+    data.extend_from_slice(&create_escrow_discriminator());
+    data.extend_from_slice(&salt); // 8..40 — the first arg of every form
+    data.extend_from_slice(&[0u8; 32]); // recipient
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // gross (not read)
+    let ix = SolIx {
+        program_id: Pubkey::new_from_array(factory),
+        accounts: vec![
+            AccountMeta::new(donor, true),
+            AccountMeta::new(Pubkey::new_from_array(escrow), false),
+        ],
+        data,
+    };
+    (ix, escrow)
+}
+
+/// A canned `getTransaction` reply carrying `ixs` at `slot`. `executed = false`
+/// makes it a reverted transaction — read perfectly well, moved nothing.
+fn canned(ixs: &[SolIx], payer: Pubkey, slot: u64, executed: bool) -> Vec<u8> {
+    let msg = SolMessage::new(ixs, Some(&payer));
     let sigs = usize::from(msg.header.num_required_signatures);
     let mut raw = vec![sigs as u8];
     raw.extend(vec![0u8; sigs * 64]);
@@ -254,7 +344,11 @@ fn canned_response(donor: [u8; 32], recipient: [u8; 32], gross: u64, slot: u64) 
         slot,
         transaction: EncodedTxWithMeta {
             meta: Some(TxMeta {
-                status: TxStatus::Ok,
+                status: if executed {
+                    TxStatus::Ok
+                } else {
+                    TxStatus::Err(Reserved)
+                },
                 inner_instructions: None,
                 loaded_addresses: None,
             }),
@@ -270,8 +364,51 @@ fn canned_response(donor: [u8; 32], recipient: [u8; 32], gross: u64, slot: u64) 
     .unwrap()
 }
 
+/// A direct-donation `Settled` from the pinned splitter plus its matching
+/// `TransferChecked` (mint = the baked USDC).
+fn canned_response(donor: [u8; 32], recipient: [u8; 32], gross: u64, slot: u64) -> Vec<u8> {
+    let donor_pk = Pubkey::new_from_array(donor);
+    canned(
+        &[
+            transfer_ix(gross, donor_pk),
+            settled_ix(donor, recipient, gross),
+        ],
+        donor_pk,
+        slot,
+        true,
+    )
+}
+
+/// Arm the mock with the next reply.
+fn set_response(pic: &PocketIc, mock: Principal, bytes: Vec<u8>) {
+    pic.update_call(
+        mock,
+        Principal::anonymous(),
+        "set_response",
+        Encode!(&bytes).unwrap(),
+    )
+    .expect("set_response");
+}
+
+fn calls(pic: &PocketIc, mock: Principal) -> u64 {
+    Decode!(&query(pic, mock, "calls", Encode!().unwrap()), u64).unwrap()
+}
+
+fn counter(pic: &PocketIc, indexer: Principal, method: &str) -> u64 {
+    Decode!(&query(pic, indexer, method, Encode!().unwrap()), u64).unwrap()
+}
+
 fn relay_ingest(pic: &PocketIc, mock: Principal, indexer: Principal, sig: &str) -> IngestResult {
-    let cycles = (config::INGEST_PRICE as u64) * 3; // > INGEST_PRICE + ATTACH_CYCLES
+    relay_ingest_with(pic, mock, indexer, sig, (config::INGEST_PRICE as u64) * 3)
+}
+
+fn relay_ingest_with(
+    pic: &PocketIc,
+    mock: Principal,
+    indexer: Principal,
+    sig: &str,
+    cycles: u64,
+) -> IngestResult {
     let outer = pic
         .update_call(
             mock,
@@ -310,13 +447,7 @@ fn paid_ingest_folds_a_settlement_into_reputation() {
     let donor = [7u8; 32];
     let recipient = [8u8; 32];
     let gross = 500_000u64;
-    pic.update_call(
-        mock,
-        Principal::anonymous(),
-        "set_response",
-        Encode!(&canned_response(donor, recipient, gross, 123)).unwrap(),
-    )
-    .expect("set_response");
+    set_response(&pic, mock, canned_response(donor, recipient, gross, 123));
 
     // Paid ingest through the relay → one settlement folded.
     let res = relay_ingest(&pic, mock, indexer, "sig-1");
@@ -337,8 +468,7 @@ fn paid_ingest_folds_a_settlement_into_reputation() {
     );
 
     // Exactly one outcall, and it carried the response cap (invariant #1).
-    let calls = Decode!(&query(&pic, mock, "calls", Encode!().unwrap()), u64).unwrap();
-    assert_eq!(calls, 1);
+    assert_eq!(calls(&pic, mock), 1);
     let cap = Decode!(
         &query(&pic, mock, "last_cap", Encode!().unwrap()),
         Option<u64>
@@ -353,6 +483,261 @@ fn paid_ingest_folds_a_settlement_into_reputation() {
         reputation(&pic, indexer, donor, recipient),
         Nat::from(gross)
     );
-    let calls_after = Decode!(&query(&pic, mock, "calls", Encode!().unwrap()), u64).unwrap();
-    assert_eq!(calls_after, 1, "a duplicate must not make another outcall");
+    assert_eq!(
+        calls(&pic, mock),
+        1,
+        "a duplicate must not make another outcall"
+    );
+
+    // The gauge that schedules the cutover, live through the canister: one book
+    // key, no births.
+    let stats = Decode!(
+        &query(&pic, indexer, "get_state_stats", Encode!().unwrap()),
+        StateStats
+    )
+    .unwrap();
+    assert_eq!(stats.book_keys, 1);
+    assert_eq!(stats.births, 0);
+    assert!(stats.heap_bytes > 0, "heap is readable inside the wasm");
+}
+
+/// An inter-canister ingest is the *paid* path — `inspect_message` never sees it.
+/// Underpayment therefore has to be caught by the gate, and caught before the
+/// outcall: this is non-negativity invariant #1 on the path that can actually
+/// attach cycles, which the ingress test cannot reach.
+#[test]
+fn an_underpaid_inter_canister_ingest_makes_no_outcall() {
+    let (pic, indexer, mock) = setup_with_mock();
+    set_response(
+        &pic,
+        mock,
+        canned_response([7u8; 32], [8u8; 32], 500_000, 123),
+    );
+
+    let res = relay_ingest_with(
+        &pic,
+        mock,
+        indexer,
+        "sig-underpaid",
+        (config::INGEST_PRICE as u64) - 1,
+    );
+    assert!(matches!(res, IngestResult::Underpaid), "got {res:?}");
+    assert_eq!(
+        calls(&pic, mock),
+        0,
+        "no outcall before payment is accepted"
+    );
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+
+    // And one cycle more is enough — the boundary is exactly `INGEST_PRICE`.
+    let ok = relay_ingest_with(
+        &pic,
+        mock,
+        indexer,
+        "sig-underpaid",
+        config::INGEST_PRICE as u64,
+    );
+    assert!(matches!(ok, IngestResult::Applied { .. }), "got {ok:?}");
+    assert_eq!(calls(&pic, mock), 1);
+}
+
+/// A finalized *reverted* transaction is read perfectly well; it simply moved
+/// nothing. It must be retired on the spot — applied, free from then on — rather
+/// than left retriable like an unreadable one: a pusher that could not tell the
+/// two apart would re-fetch a permanent non-event forever, at full price.
+#[test]
+fn a_reverted_transaction_is_retired_not_retried() {
+    let (pic, indexer, mock) = setup_with_mock();
+    let donor = Pubkey::new_from_array([7u8; 32]);
+    set_response(
+        &pic,
+        mock,
+        canned(
+            &[
+                transfer_ix(500_000, donor),
+                settled_ix([7u8; 32], [8u8; 32], 500_000),
+            ],
+            donor,
+            123,
+            false, // reverted
+        ),
+    );
+
+    let res = relay_ingest(&pic, mock, indexer, "sig-reverted");
+    assert!(
+        matches!(
+            res,
+            IngestResult::Applied {
+                settlements: 0,
+                births: 0,
+                anomalies: 0
+            }
+        ),
+        "a reverted transaction folds nothing, but is done with: got {res:?}"
+    );
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 1);
+    // Its `Settled` was never folded — the transaction reverted, so no money moved.
+    assert_eq!(
+        reputation(&pic, indexer, [7u8; 32], [8u8; 32]),
+        Nat::from(0u8)
+    );
+
+    // Free from here on, and no second outcall: exactly-once retired it.
+    let again = relay_ingest(&pic, mock, indexer, "sig-reverted");
+    assert!(matches!(again, IngestResult::Duplicate), "got {again:?}");
+    assert_eq!(calls(&pic, mock), 1);
+}
+
+/// The attribution chain end to end (architecture §4), across two ingests: a
+/// birth records `escrow → donor`, and a later settlement whose on-chain donor is
+/// that escrow is credited to the funding donor instead of to the escrow address.
+/// This is the property the birth seed exists to preserve across generations.
+#[test]
+fn an_escrow_settlement_is_credited_to_its_funding_donor() {
+    let (pic, indexer, mock) = setup_with_mock();
+    let donor = Pubkey::new_from_array([7u8; 32]);
+    let recipient = [8u8; 32];
+    let gross = 500_000u64;
+
+    // 1. The birth: `create_escrow` from a pinned factory, escrow = the real PDA.
+    let (ix, escrow) = create_escrow_ix(donor, [42u8; 32]);
+    set_response(&pic, mock, canned(&[ix], donor, 100, true));
+    let res = relay_ingest(&pic, mock, indexer, "sig-birth");
+    assert!(
+        matches!(
+            res,
+            IngestResult::Applied {
+                settlements: 0,
+                births: 1,
+                anomalies: 0
+            }
+        ),
+        "got {res:?}"
+    );
+
+    // The birth is queryable, and enumerable as the successor's seed.
+    let (birth, witness) = Decode!(
+        &query(
+            &pic,
+            indexer,
+            "get_birth",
+            Encode!(&escrow.to_vec()).unwrap()
+        ),
+        Option<crown_indexer::BirthView>,
+        Vec<u8>
+    )
+    .unwrap();
+    let birth = birth.expect("the birth was recorded");
+    assert_eq!(birth.donor, donor.to_bytes().to_vec());
+    assert_eq!(birth.slot, 100);
+    assert!(!witness.is_empty());
+
+    let page = Decode!(
+        &query(
+            &pic,
+            indexer,
+            "get_births_page",
+            Encode!(&None::<Vec<u8>>, &10u32).unwrap()
+        ),
+        Option<Vec<crown_indexer::BirthEntry>>
+    )
+    .unwrap()
+    .expect("a well-formed cursor answers with a page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].escrow, escrow.to_vec());
+    assert_eq!(page[0].donor, donor.to_bytes().to_vec());
+
+    // 2. The settlement, a later slot, paid out *by the escrow*: the on-chain
+    //    donor of the event is the escrow PDA, and so is the transfer authority.
+    let escrow_pk = Pubkey::new_from_array(escrow);
+    set_response(
+        &pic,
+        mock,
+        canned(
+            &[
+                transfer_ix(gross, escrow_pk),
+                settled_ix(escrow, recipient, gross),
+            ],
+            escrow_pk,
+            200,
+            true,
+        ),
+    );
+    let res = relay_ingest(&pic, mock, indexer, "sig-settle");
+    assert!(
+        matches!(res, IngestResult::Applied { settlements: 1, .. }),
+        "got {res:?}"
+    );
+
+    // Credited to the human who funded the escrow …
+    assert_eq!(
+        reputation(&pic, indexer, donor.to_bytes(), recipient),
+        Nat::from(gross)
+    );
+    // … and not to the escrow address, which is the silent, permanent failure
+    // mode an unseeded generation would fall into.
+    assert_eq!(reputation(&pic, indexer, escrow, recipient), Nat::from(0u8));
+}
+
+/// The generation boundary (architecture §8, handoff mechanism #1), on a build
+/// that actually has one. `cutover_slot = 0` in both shipped profiles, so without
+/// this profile the `AfterCutover` branch is dead code in every buildable
+/// configuration and would run for the first time in production, on a canister
+/// nobody can fix.
+#[test]
+fn after_cutover_is_refused_without_spending_the_signature() {
+    let wasm = build_indexer_wasm("cutover", "target/profile-cutover");
+    let (pic, indexer, mock) = setup_with_mock_wasm(wasm);
+    let donor = [7u8; 32];
+    let recipient = [8u8; 32];
+    let gross = 500_000u64;
+
+    // Slot 5000 is past the profile's boundary of 1000: the next generation's
+    // mandate, not this one's.
+    set_response(&pic, mock, canned_response(donor, recipient, gross, 5000));
+    let res = relay_ingest(&pic, mock, indexer, "sig-late");
+    assert!(matches!(res, IngestResult::AfterCutover), "got {res:?}");
+    assert_eq!(
+        calls(&pic, mock),
+        1,
+        "the slot is only knowable from the reply"
+    );
+    assert_eq!(
+        reputation(&pic, indexer, donor, recipient),
+        Nat::from(0u8),
+        "nothing past the boundary reaches this generation's book"
+    );
+
+    // Not applied: the signature must stay free for the successor to fold, or the
+    // settlement falls into the gap between generations.
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+
+    // Repeating it changes nothing — refusal past the boundary touches no state.
+    for _ in 0..5 {
+        assert!(matches!(
+            relay_ingest(&pic, mock, indexer, "sig-late"),
+            IngestResult::AfterCutover
+        ));
+    }
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+
+    // And the same signature is still free to fold: a transaction *before* the
+    // boundary folds normally, which is what "the signature stays free" means.
+    set_response(&pic, mock, canned_response(donor, recipient, gross, 999));
+    let res = relay_ingest(&pic, mock, indexer, "sig-late");
+    assert!(
+        matches!(res, IngestResult::Applied { settlements: 1, .. }),
+        "the signature was never consumed by the refusals: got {res:?}"
+    );
+    assert_eq!(
+        reputation(&pic, indexer, donor, recipient),
+        Nat::from(gross)
+    );
+
+    // The last slot before the boundary is ours; the boundary itself is not.
+    set_response(&pic, mock, canned_response(donor, recipient, gross, 1000));
+    assert!(matches!(
+        relay_ingest(&pic, mock, indexer, "sig-at-boundary"),
+        IngestResult::AfterCutover
+    ));
 }

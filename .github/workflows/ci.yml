@@ -14,19 +14,53 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # e2e гоняет настоящую IC-реплику и без сервера падает, а не пропускается —
+      # то есть без этого шага `cargo test` в CI красный. Версия сервера обязана
+      # совпадать с крейтом `pocket-ic` в Cargo.toml (13.0.0).
+      - name: pocket-ic server
+        run: |
+          curl -fsSL https://github.com/dfinity/pocketic/releases/download/13.0.0/pocket-ic-x86_64-linux.gz \
+            | gunzip > "$RUNNER_TEMP/pocket-ic"
+          chmod +x "$RUNNER_TEMP/pocket-ic"
+          "$RUNNER_TEMP/pocket-ic" --version
+          echo "POCKET_IC_BIN=$RUNNER_TEMP/pocket-ic" >> "$GITHUB_ENV"
+
       - name: test
         run: cargo test
 
       # Border (01-standards): единственный не-query — платный ingest.
+      #
+      # Считаем только строки объявления методов внутри блока `service`, а не
+      # что попало во всём файле: у `.did` есть комментарии (в том числе
+      # кончающиеся словом «query») и строка самого `service : () -> {`, и
+      # прежняя версия проверки ловила и то и другое — два ложных срабатывания
+      # гасили друг друга, так что проверка проходила по совпадению. Регексп
+      # `^[[:space:]]+[a-z_]+[[:space:]]*:.*->` не может совпасть с комментарием:
+      # тот начинается с `//`.
       - name: single non-query is ingest
         run: |
-          n="$(grep -cE '\)[[:space:]]*->' crown-indexer.did || true)"
-          q="$(grep -cE 'query;?[[:space:]]*$' crown-indexer.did || true)"
+          body="$(sed -n '/^service *: *() *-> *{/,/^}/p' crown-indexer.did)"
+          decls="$(printf '%s\n' "$body" | grep -E '^[[:space:]]+[a-z_]+[[:space:]]*:.*->' || true)"
+          n="$(printf '%s\n' "$decls" | grep -c . || true)"
+          q="$(printf '%s\n' "$decls" | grep -c 'query;[[:space:]]*$' || true)"
+          echo "$decls"
+          test "$n" -ge 2 || { echo "did not find the service methods — the check itself is broken"; exit 1; }
           test "$((n - q))" -eq 1 || { echo ".did has non-query methods other than ingest"; exit 1; }
-          grep -qE '^[[:space:]]*ingest[[:space:]]*:' crown-indexer.did
+          printf '%s\n' "$decls" | grep -qE '^[[:space:]]+ingest[[:space:]]*:.*->[^;]*;[[:space:]]*$' \
+            || { echo "the single non-query is not ingest"; exit 1; }
 
-      # Border: mainnet-профиль без Custom-источников (проверяем только строки
-      # `source =`, комментарии игнорируются).
-      - name: mainnet has no Custom RPC source
+      # Тот же .did обязан совпадать с тем, что реально экспортирует wasm:
+      # иначе граница проверяется по файлу, который никто не сверял с кодом.
+      - name: .did matches the wasm
         run: |
-          ! grep -E '^[[:space:]]*source[[:space:]]*=' config/mainnet.toml | grep -qw Custom
+          cargo install candid-extractor --locked
+          rustup target add wasm32-unknown-unknown
+          cargo build --lib --release --target wasm32-unknown-unknown
+          candid-extractor target/wasm32-unknown-unknown/release/crown_indexer.wasm > /tmp/gen.did
+          diff -u crown-indexer.did /tmp/gen.did
+
+      # Прежний линт «mainnet-профиль без Custom-источников» удалён (P7.5): он
+      # грепал ключ `source =`, которого в конфиге нет, а `RpcSources` имеет
+      # единственную ветку `Default(cluster)` — `Custom` не выразим типом. Линт,
+      # который не может покраснеть, хуже отсутствующего: он читается как
+      # гарантия, а даёт её тип (`07-build-plan.md §Ключевые DoD`).

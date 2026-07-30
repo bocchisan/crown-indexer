@@ -20,6 +20,8 @@ ciborium = "0.2"          # CBOR-сериализация свидетеля (с
 
 [dev-dependencies]
 solana-program = "2"  # эталонная сериализация транзакции для кросс-проверки парсера
+crown-derive = { path = "../crown-factory/derive" }  # PDA эскроу в e2e-атрибуции
+sha2 = "0.10"           # дискриминаторы Anchor в каннед-транзакциях e2e
 pocket-ic = "13"      # e2e на реальной IC-реплике (сервер 13.0.0 из комплекта dfx)
 ic-certification = "3"  # проверка сертификата: lookup certified_data в дереве
 serde_cbor = "0.11"     # borrowed CBOR-декод сертификата в тесте (ic-certification zero-copy)
