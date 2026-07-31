@@ -6,12 +6,35 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Чекаутится в именованный каталог, чтобы соседние репы легли **рядом**,
+      # ровно как в дереве разработчика: `Cargo.toml` тянет `crown-reduce` и
+      # `crown-factory/derive` по `path = "../…"`, и одиночный чекаут не
+      # разрешается вовсе — `cargo` падает на манифесте до первой строки кода.
+      # (Приватный сосед потребовал бы PAT в `token:` — дефолтный GITHUB_TOKEN
+      # достаёт только собираемый реп.)
       - uses: actions/checkout@v4
+        with:
+          path: crown-indexer
+
+      # Закон книги: свёртка живёт здесь, а не копией в индексе.
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-reduce
+          path: crown-reduce
+
+      # `crown-derive` — единственный шов с фабрикой: пересчёт PDA эскроу при
+      # распознавании рождений (`00 §4`).
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-factory
+          path: crown-factory
 
       - name: fmt
+        working-directory: crown-indexer
         run: cargo fmt --all -- --check
 
       - name: clippy
+        working-directory: crown-indexer
         run: cargo clippy --all-targets -- -D warnings
 
       # e2e гоняет настоящую IC-реплику и без сервера падает, а не пропускается —
@@ -26,7 +49,13 @@ jobs:
           echo "POCKET_IC_BIN=$RUNNER_TEMP/pocket-ic" >> "$GITHUB_ENV"
 
       - name: test
+        working-directory: crown-indexer
         run: cargo test
+
+      # Отдельного шага «собери профиль `cutover`» здесь нет намеренно: его
+      # собирает сам `cargo test` — `after_cutover_is_refused_without_spending_the_signature`
+      # пересобирает wasm с включённой границей и ставит его в реплику. Шаг,
+      # который не может покраснеть раньше другого, хуже отсутствующего (P7.13).
 
       # Border (01-standards): единственный не-query — платный ingest.
       #
@@ -38,6 +67,7 @@ jobs:
       # `^[[:space:]]+[a-z_]+[[:space:]]*:.*->` не может совпасть с комментарием:
       # тот начинается с `//`.
       - name: single non-query is ingest
+        working-directory: crown-indexer
         run: |
           body="$(sed -n '/^service *: *() *-> *{/,/^}/p' crown-indexer.did)"
           decls="$(printf '%s\n' "$body" | grep -E '^[[:space:]]+[a-z_]+[[:space:]]*:.*->' || true)"
@@ -52,6 +82,7 @@ jobs:
       # Тот же .did обязан совпадать с тем, что реально экспортирует wasm:
       # иначе граница проверяется по файлу, который никто не сверял с кодом.
       - name: .did matches the wasm
+        working-directory: crown-indexer
         run: |
           cargo install candid-extractor --locked
           rustup target add wasm32-unknown-unknown
