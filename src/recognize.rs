@@ -455,4 +455,60 @@ mod tests {
         };
         assert!(recognize(&foreign, &cfg()).births.is_empty());
     }
+
+    /// One paid read, many recognized events — the property the whole cost model
+    /// rests on and nothing checked.
+    ///
+    /// `INGEST_PRICE` buys one `getTransaction`, not one escrow: the fetch is per
+    /// **transaction**, so a client that puts `B` births (or `K` settlements) in a
+    /// single Solana transaction divides the per-settlement cost of that term by
+    /// `B` (by `K`). That is exactly what the `g/K` term of `cost.md §2` means, and
+    /// it is a property of *this* function — it walks every instruction and keeps
+    /// every event it recognizes, with no notion of "the" birth or "the"
+    /// settlement.
+    ///
+    /// Pinned as a test because the batching lives entirely in the client: nothing
+    /// here would fail loudly if recognition quietly started keeping only the first
+    /// event, and the model would go on claiming an amortization that no longer
+    /// happened.
+    #[test]
+    fn one_transaction_carries_a_batch_of_births_and_settlements() {
+        let donors: [Address; 3] = [[10u8; 32], [11u8; 32], [12u8; 32]];
+        let recipient = [20u8; 32];
+        let mut instrs = Vec::new();
+        let mut escrows = Vec::new();
+
+        // Three `create_escrow` of the pinned factory, one transaction.
+        for (i, donor) in donors.iter().enumerate() {
+            let salt = [i as u8 + 1; 32];
+            let (escrow, _) =
+                crown_derive::solana_pda_address(FACTORY, &[b"escrow", &salt]).unwrap();
+            escrows.push(escrow);
+            instrs.push(create_escrow(FACTORY, *donor, escrow, salt, 1_000));
+        }
+        // …and three settlements, each with its own executed transfer, as a batched
+        // claim transaction produces them.
+        for donor in &donors {
+            instrs.push(transfer_checked(USDC, 500, *donor));
+            instrs.push(settled_event(SPLITTER, *donor, recipient, 500));
+        }
+
+        let r = recognize(&Tx { slot: 900, instrs }, &cfg());
+
+        assert_eq!(r.births.len(), 3, "every birth in the batch is recognized");
+        assert_eq!(
+            r.settlements.len(),
+            3,
+            "every settlement in the batch is recognized"
+        );
+        assert_eq!(r.anomalies, 0, "each event found its own distinct transfer");
+        for (i, (escrow, birth)) in r.births.iter().enumerate() {
+            assert_eq!(*escrow, escrows[i]);
+            assert_eq!(birth.donor, donors[i]);
+            assert_eq!(
+                birth.slot, 900,
+                "the slot is the transaction's, not the event's"
+            );
+        }
+    }
 }
