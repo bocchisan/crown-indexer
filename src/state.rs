@@ -45,6 +45,14 @@ pub fn births_page(start_after: Option<[u8; 32]>, limit: usize) -> Vec<([u8; 32]
     STATE.with_borrow(|s| s.births_page(start_after, limit))
 }
 
+/// One page of the book for the successor generation (architecture §8).
+pub fn book_page(
+    start_after: Option<&[u8]>,
+    limit: usize,
+) -> Vec<(ChainId, [u8; 32], [u8; 32], u128)> {
+    STATE.with_borrow(|s| s.book_page(start_after, limit))
+}
+
 /// The capacity gauge: heap bytes in use, populated book keys, recorded births.
 ///
 /// Heap is the binding limit — all state lives there (no stable memory), the book

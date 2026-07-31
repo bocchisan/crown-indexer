@@ -213,6 +213,55 @@ impl Certified {
         self.births_count
     }
 
+    /// One page of book entries in key order, starting strictly after
+    /// `start_after` (or at the beginning). At most `limit` entries.
+    ///
+    /// Consumer: the generational handoff (architecture §8), the same one
+    /// `births_page` serves, and it must exist before the freeze for the same
+    /// reason — a blackholed generation grows no new query. `reputation` cannot
+    /// supply it: it answers only for a `(chain, donor, recipient)` you already
+    /// know, and the successor by construction knows none of them. Hence
+    /// enumeration.
+    ///
+    /// What it buys over summing generations. Without it the successor starts
+    /// empty and a reader adds gen-1 + gen-2, which is correct (the law is
+    /// additive, §2) but makes every past generation a permanent liability: gen-1
+    /// must stay funded and readable forever, since an unreadable gen-1 turns the
+    /// sum into nothing, and after `n` cutovers a reader queries `n+1` canisters.
+    /// With enumeration the successor can absorb gen-1 wholesale and verify the
+    /// copy in one shot — rebuild the tree, compare the reconstructed root against
+    /// gen-1's certificate — after which gen-1 is disposable. One BLS check for
+    /// the whole book, against one paid outcall per transaction if the successor
+    /// had to re-read the chain instead (`08-deferred.md §Переезд поколения`).
+    ///
+    /// Absorbing is *not* the same trust as recomputing, and the difference is the
+    /// choice: a copy inherits gen-1's recognition verbatim, so it is right only
+    /// when gen-1's book is right (capacity ran out, a factory was added). A book
+    /// wrong by a bug is fixed only by folding the chain from scratch.
+    ///
+    /// Paging, cursor semantics and the O(n) walk are exactly `births_page`'s, for
+    /// exactly its reasons — see there; the cursor is the 96-byte book key.
+    pub fn book_page(
+        &self,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(ChainId, [u8; 32], [u8; 32], u128)> {
+        self.book_tree
+            .iter()
+            .skip_while(|(k, _)| match start_after {
+                Some(cursor) => k.as_slice() <= cursor,
+                None => false,
+            })
+            .filter_map(|(k, v)| {
+                let chain: [u8; 32] = k.get(..32)?.try_into().ok()?;
+                let donor: [u8; 32] = k.get(32..64)?.try_into().ok()?;
+                let recipient: [u8; 32] = k.get(64..96)?.try_into().ok()?;
+                Some((ChainId(chain), donor, recipient, leaf_value(Some(v))))
+            })
+            .take(limit)
+            .collect()
+    }
+
     /// Number of populated book keys. With `births_count` and the heap size this
     /// is the capacity gauge: the book is monotone by law (§2) and never shrinks,
     /// so on a blackholed canister these numbers are the only warning that the
@@ -475,6 +524,93 @@ mod tests {
         expected.sort();
         assert_eq!(seen, expected);
         assert_eq!(s.births_count(), 10);
+    }
+
+    #[test]
+    fn book_page_walks_every_key_exactly_once_and_carries_the_total() {
+        let mut s = Certified::new();
+        for i in 0..10u8 {
+            s.apply_settlement(settled(1, i, i.wrapping_add(1), 100))
+                .unwrap();
+            // Same key twice: the page must carry the accumulated total, not the
+            // last settlement — the successor folds what it is given, once.
+            s.apply_settlement(settled(1, i, i.wrapping_add(1), 5))
+                .unwrap();
+        }
+
+        let mut seen: Vec<(Vec<u8>, u128)> = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = s.book_page(cursor.as_deref(), 3);
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 3, "a page never exceeds its limit");
+            cursor = page.last().map(|(c, d, r, _)| book_key(*c, *d, *r));
+            seen.extend(page.into_iter().map(|(c, d, r, v)| (book_key(c, d, r), v)));
+        }
+
+        // Every key, once, in key order. A skipped key is reputation the successor
+        // never learns about; a repeated one is reputation invented out of a page
+        // boundary — and the law has no way to take either back.
+        assert_eq!(seen.len(), 10);
+        assert_eq!(s.book_keys(), 10);
+        assert!(seen.iter().all(|(_, v)| *v == 105));
+        let mut keys: Vec<Vec<u8>> = seen.iter().map(|(k, _)| k.clone()).collect();
+        let sorted = {
+            let mut k = keys.clone();
+            k.sort();
+            k
+        };
+        assert_eq!(keys, sorted, "pages come in key order");
+        keys.dedup();
+        assert_eq!(keys.len(), 10);
+    }
+
+    /// The property the enumeration exists for, end to end: a successor that folds
+    /// the pages it was handed lands on **the same root** gen-1's certificate
+    /// commits to. That equality is the whole verification — one comparison for
+    /// the entire state, instead of a witness per entry or a paid re-read of the
+    /// chain per transaction (`08-deferred.md §Переезд поколения`).
+    ///
+    /// It works because a book leaf is the accumulated total and the law is a
+    /// plain sum (§2): folding each total once reproduces the leaf exactly. The
+    /// successor needs no knowledge of how gen-1 arrived there.
+    #[test]
+    fn a_successor_rebuilt_from_the_pages_reconstructs_the_same_root() {
+        let mut gen1 = Certified::new();
+        for i in 0..7u8 {
+            gen1.apply_settlement(settled(1, i, i.wrapping_add(1), 100 + u128::from(i)))
+                .unwrap();
+            gen1.apply_settlement(settled(2, i, i.wrapping_add(1), 9))
+                .unwrap();
+            gen1.record_birth(
+                [i; 32],
+                Birth {
+                    donor: [i.wrapping_add(100); 32],
+                    slot: u64::from(i),
+                },
+            );
+        }
+
+        // The handoff: gen-2 folds every book entry once and copies every birth.
+        let mut gen2 = Certified::new();
+        for (chain, donor, recipient, gross) in gen1.book_page(None, 1_000) {
+            gen2.apply_settlement(Settled {
+                chain,
+                donor,
+                recipient,
+                gross,
+            })
+            .unwrap();
+        }
+        for (escrow, birth) in gen1.births_page(None, 1_000) {
+            gen2.record_birth(escrow, birth);
+        }
+
+        assert_eq!(gen2.combined_root(), gen1.combined_root());
+        assert_eq!(gen2.book_keys(), gen1.book_keys());
+        assert_eq!(gen2.births_count(), gen1.births_count());
     }
 
     /// The count is kept, not derived (`RbTree` has no `len`), so re-recording an

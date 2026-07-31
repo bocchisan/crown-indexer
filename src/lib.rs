@@ -88,9 +88,21 @@ pub struct BirthEntry {
     pub slot: u64,
 }
 
+/// One enumerated book entry, for the successor generation (`get_book_page`).
+/// The key is surfaced as its three parts rather than the raw 96 bytes: the
+/// successor has to rebuild the key to rebuild the tree, and a layout it has to
+/// infer is a layout that can be inferred wrong.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct BookEntry {
+    pub chain: Vec<u8>,
+    pub donor: Vec<u8>,
+    pub recipient: Vec<u8>,
+    pub reputation: Nat,
+}
+
 /// The capacity gauge (`get_state_stats`). All state is heap-resident and the
 /// book only grows, so these numbers are what says how much of this generation
-/// is left — plus the one reading that exposes a wedged reservation.
+/// is left.
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct StateStats {
     pub heap_bytes: u64,
@@ -101,6 +113,11 @@ pub struct StateStats {
 /// Largest `get_births_page` reply. Sized so a full page stays well inside the
 /// query response limit (~80 B per entry on the wire → under 1 MiB).
 const MAX_BIRTHS_PAGE: usize = 10_000;
+
+/// Largest `get_book_page` reply. Half of `MAX_BIRTHS_PAGE` because an entry is
+/// roughly twice the size (three 32-byte fields plus the value against an escrow
+/// and a donor), so a full page lands in the same place inside the limit.
+const MAX_BOOK_PAGE: usize = 5_000;
 
 /// A recorded escrow birth, for `get_birth`. `gross` is not surfaced: the index
 /// stores only `donor`/`slot` (a game's address derivation already commits `gross`).
@@ -335,6 +352,41 @@ fn get_births_page(start_after: Option<Vec<u8>>, limit: u32) -> Option<Vec<Birth
                 escrow: escrow.to_vec(),
                 donor: b.donor.to_vec(),
                 slot: b.slot,
+            })
+            .collect(),
+    )
+}
+
+/// One page of the book in key order, starting strictly after `start_after`.
+/// `None` means the cursor was not a 96-byte key; an empty vector means the walk
+/// is done — told apart for `get_births_page`'s reason, a truncated walk that
+/// reads as a finished one.
+///
+/// Consumer: the generational handoff (architecture §8). Free query, so absorbing
+/// gen-1 costs nothing, and the copy is verifiable in one shot rather than entry
+/// by entry: rebuild the tree from these pages, and the reconstructed root must
+/// equal the one gen-1's certificate commits to (`get_certificate`). One check
+/// for the whole book — against one paid outcall per transaction, had the
+/// successor been made to re-read the chain instead.
+///
+/// The cursor is `chain ‖ donor ‖ recipient`, i.e. the three fields of the
+/// previous page's last entry concatenated in that order.
+#[ic_cdk::query]
+fn get_book_page(start_after: Option<Vec<u8>>, limit: u32) -> Option<Vec<BookEntry>> {
+    if start_after.as_ref().is_some_and(|c| c.len() != 96) {
+        return None;
+    }
+    // Clamped to at least one for `get_births_page`'s reason: a zero `limit`
+    // answering "empty" forever stalls the walk short of the end.
+    let limit = (limit as usize).clamp(1, MAX_BOOK_PAGE);
+    Some(
+        state::book_page(start_after.as_deref(), limit)
+            .into_iter()
+            .map(|(chain, donor, recipient, reputation)| BookEntry {
+                chain: chain.0.to_vec(),
+                donor: donor.to_vec(),
+                recipient: recipient.to_vec(),
+                reputation: Nat::from(reputation),
             })
             .collect(),
     )
