@@ -7,8 +7,8 @@ use crown_reduce::ChainId;
 
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
 
-/// Modelled worst-case cycle cost of one `getTransaction`, from the IC
-/// HTTPS-outcall price formula applied per queried provider:
+/// What the IC itself charges the SOL RPC canister for one `getTransaction`, from
+/// the published HTTPS-outcall formula applied per queried provider:
 ///
 /// ```text
 /// per_provider = (3_000_000 + 60_000·n)·n        // base
@@ -19,16 +19,50 @@ include!(concat!(env!("OUT_DIR"), "/config.rs"));
 ///
 /// `n` is the SOL RPC canister's subnet size. The response term is charged on the
 /// **cap**, not the actual body, which is why `response_max_bytes` is a cost knob
-/// on every ingest and not a free safety margin. The cost-gate (P8) re-measures
-/// the live price and re-pins these inputs; this model only has to be an upper
-/// bound good enough to refuse an incoherent config at compile time.
+/// on every ingest and not a free safety margin.
 ///
-/// The only copy. It used to be written twice — here and in `build.rs` — with
-/// nothing checking that the two agreed, on the one number the freeze depends on.
-const OUTCALL_WORST_CASE: u128 = ((3_000_000 + 60_000 * RPC_NODES) * RPC_NODES
+/// This is a **floor, not the price.** The index does not make the outcall — it
+/// calls a canister that makes it, and that canister charges its own tariff on
+/// top. Kept because it is the one part of the price that is a published law
+/// rather than someone's tariff: if the measured price below ever fell under it,
+/// the measurement would be the thing that is wrong.
+const IC_OUTCALL_FLOOR: u128 = ((3_000_000 + 60_000 * RPC_NODES) * RPC_NODES
     + 400 * RPC_NODES * RPC_REQUEST_BYTES
     + 800 * RPC_NODES * RESPONSE_MAX_BYTES as u128)
     * RPC_PROVIDERS;
+
+/// The SOL RPC canister's own tariff for one `getTransaction`, per provider:
+/// a fixed part plus the response cap. Measured against the live canister's free
+/// `getTransactionCyclesCost` query on **2026-07-31**, across caps 4–64 KiB and
+/// 3–6 providers; both axes are linear and these two constants reproduce every
+/// sample exactly.
+///
+/// ```text
+/// per_provider = 516_479_040 + 27_200 · max_response_bytes
+/// ```
+///
+/// **Why this replaced the IC formula as the gate's input.** The gate used to
+/// price the ingest off `IC_OUTCALL_FLOOR`, which for the shipped config is
+/// 5_381_248_000 — while the canister actually asks 7_038_843_200, a third more.
+/// So the "≥2× margin" the ordering below claims to enforce was really 1.7×, and
+/// the direction of that error is the fatal one: under-attaching arrives here as
+/// `Consistent(Err(TooFewCycles))`, i.e. an ordinary unreadable reply, on a
+/// canister that cannot be patched. A tariff can move, so this is re-measured at
+/// the cost-gate; what must not happen is pricing our work off someone else's
+/// cost instead of their price.
+const SOL_RPC_PER_PROVIDER: u128 = 516_479_040 + 27_200 * RESPONSE_MAX_BYTES as u128;
+
+/// The price of one paid ingest's outcall, as the callee charges it.
+const OUTCALL_WORST_CASE: u128 = SOL_RPC_PER_PROVIDER * RPC_PROVIDERS;
+
+// The tariff cannot sit below the law it is derived from: the canister pays the
+// IC for the same outcall out of what it charges us. A config where it does means
+// one of the two models was mistyped.
+const _: () = assert!(
+    OUTCALL_WORST_CASE >= IC_OUTCALL_FLOOR,
+    "the measured SOL RPC tariff is below what the IC charges for the same outcall \
+     — one of the two models is wrong"
+);
 
 /// Cycles held back from `INGEST_PRICE` for the index's own execution of one
 /// ingest — decode, recognize, fold, two `RbTree` inserts, re-certify. Reserved
@@ -124,13 +158,13 @@ mod tests {
     fn testnet_cost_gate_constants_are_baked() {
         // Straight from config/testnet.toml — the freezable cost-gate values.
         assert_eq!(PROFILE, "testnet");
-        assert_eq!(INGEST_PRICE, 13_700_000_000);
+        assert_eq!(INGEST_PRICE, 17_000_000_000);
         assert_eq!(MIN_GROSS, 200_000);
         assert_eq!(chain_config().min_gross, 200_000); // floor wired into recognition
         assert_eq!(CYCLE_FLOOR, 1_000_000_000_000);
         assert_eq!(CONSENSUS, 3);
         assert_eq!(RPC_PROVIDERS, 5); // asked for as `total`, not just priced
-        assert_eq!(ATTACH_CYCLES, 12_000_000_000);
+        assert_eq!(ATTACH_CYCLES, 15_000_000_000);
         assert_eq!(RESPONSE_MAX_BYTES, 32_768);
         // Devnet runs a single generation, so the boundary is off. On mainnet it
         // is a cost-gate value (P8) and must be reachable before the heap fills —
@@ -147,9 +181,9 @@ mod tests {
     fn the_cutover_profile_arms_the_boundary_and_changes_nothing_else() {
         assert_eq!(PROFILE, "cutover");
         assert_eq!(CUTOVER_SLOT, Some(1000));
-        assert_eq!(INGEST_PRICE, 13_700_000_000);
+        assert_eq!(INGEST_PRICE, 17_000_000_000);
         assert_eq!(MIN_GROSS, 200_000);
-        assert_eq!(ATTACH_CYCLES, 12_000_000_000);
+        assert_eq!(ATTACH_CYCLES, 15_000_000_000);
         assert_eq!(CHAIN_ID, super::tests::devnet_chain_id());
     }
 
@@ -167,13 +201,26 @@ mod tests {
     /// code), so nothing is left for a runtime test to catch. What is worth
     /// pinning here is the *model itself*: if the formula is ever edited, this
     /// says what number it used to produce.
+    /// Both models, pinned to the numbers they produced when they were measured —
+    /// so an edit to either formula says what it changed.
+    ///
+    /// The gap between them is the point: the IC's published outcall price is the
+    /// floor (what the SOL RPC canister pays), the tariff is what it charges. The
+    /// ordering `2·tariff ≤ ATTACH_CYCLES ≤ INGEST_PRICE − reserve` is a
+    /// compile-time law above; only the values need pinning here.
     #[test]
-    fn the_outcall_cost_model_is_the_documented_formula() {
+    fn both_outcall_models_are_the_documented_formulas() {
         // 34-node subnet, 5 providers, 1 KiB request, 32 KiB response cap.
-        // The ordering `2·worst_case ≤ ATTACH_CYCLES ≤ INGEST_PRICE − reserve` is
-        // already a compile-time law above; only the model's own value needs
-        // pinning here.
-        assert_eq!(OUTCALL_WORST_CASE, 5_381_248_000);
+        assert_eq!(IC_OUTCALL_FLOOR, 5_381_248_000);
+        // Measured 2026-07-31 against `getTransactionCyclesCost` on the live
+        // canister, for exactly the request `rpc.rs` builds. The gap between the
+        // two — 30.8% on this config — is the canister's own margin, and it is
+        // stated in prose rather than asserted: "the tariff sits at least 30% over
+        // the law" is not a law, it is this month's reading, and a build that
+        // breaks because the callee got *cheaper* would be a check working against
+        // its own purpose. What must hold is `tariff >= floor`, and that is a
+        // `const _: ()` above.
+        assert_eq!(OUTCALL_WORST_CASE, 7_038_843_200);
     }
 
     // The cycle margin (`≥2×` the model, `+ EXECUTION_RESERVE ≤ INGEST_PRICE`),
