@@ -48,6 +48,11 @@ jobs:
           "$RUNNER_TEMP/pocket-ic" --version
           echo "POCKET_IC_BIN=$RUNNER_TEMP/pocket-ic" >> "$GITHUB_ENV"
 
+      # e2e собирает wasm индекса **сам** (в т.ч. профилем `cutover`), поэтому цель
+      # нужна до тестов, а не только на шаге `.did`.
+      - name: wasm target
+        run: rustup target add wasm32-unknown-unknown
+
       - name: test
         working-directory: crown-indexer
         run: cargo test
@@ -85,7 +90,6 @@ jobs:
         working-directory: crown-indexer
         run: |
           cargo install candid-extractor --locked
-          rustup target add wasm32-unknown-unknown
           cargo build --lib --release --target wasm32-unknown-unknown
           candid-extractor target/wasm32-unknown-unknown/release/crown_indexer.wasm > /tmp/gen.did
           diff -u crown-indexer.did /tmp/gen.did
