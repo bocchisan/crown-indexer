@@ -469,7 +469,27 @@ fn paid_ingest_folds_a_settlement_into_reputation() {
     set_response(&pic, mock, canned_response(donor, recipient, gross, 123));
 
     // Paid ingest through the relay → one settlement folded.
+    //
+    // Measure what the ingest actually *costs us* while we are here. The mock
+    // refuses the attached cycles, so the balance delta across the call is
+    // `INGEST_PRICE − execution`, and `execution` is the number
+    // `EXECUTION_RESERVE` claims to be "an order of magnitude over any measured
+    // ingest execution" — a claim that until now nothing measured. This is the
+    // expensive shape too: decode, recognize, fold, two `RbTree` inserts and a
+    // re-certification, not an early refusal.
+    let before = pic.cycle_balance(indexer);
     let res = relay_ingest(&pic, mock, indexer, "sig-1");
+    let execution =
+        config::INGEST_PRICE.saturating_sub(pic.cycle_balance(indexer).saturating_sub(before));
+    println!(
+        "[cost] ingest execution: {execution} cycles (reserve {})",
+        config::EXECUTION_RESERVE
+    );
+    assert!(
+        execution < config::EXECUTION_RESERVE,
+        "one ingest executed for {execution} cycles, over the {} held back for it —          the compile-time law in `config.rs` no longer bounds what an ingest can cost",
+        config::EXECUTION_RESERVE
+    );
     assert!(
         matches!(
             res,
@@ -932,4 +952,285 @@ fn after_cutover_is_refused_without_spending_the_signature() {
         relay_ingest(&pic, mock, indexer, "sig-at-boundary"),
         IngestResult::AfterCutover
     ));
+}
+
+/// **Generation capacity, measured through the canister rather than asserted in a
+/// document.** `cost.md §7` publishes bytes-per-unit (book key / birth / applied
+/// signature) and a ceiling in ingests derived from them — and until now nothing
+/// executed that derivation. The numbers matter more than most: the index is
+/// blackholed, its heap is the only storage it will ever have, and `CUTOVER_SLOT`
+/// is pinned off exactly this arithmetic. A model that is wrong here is wrong in
+/// the one direction that cannot be fixed after the freeze.
+///
+/// So: fold real settlements through the real ingest path and watch `heap_bytes`
+/// move. Each one is a fresh `(donor, recipient)` pair, i.e. the worst case the
+/// model assumes — a new book key every time, never a top-up of an existing one.
+///
+/// What this asserts is the **ceiling**, not the exact figure: a per-settlement
+/// cost above the model would mean the generation runs out sooner than
+/// `CUTOVER_SLOT` assumes, which is the failure with no recovery. Coming in under
+/// it is free headroom and needs no test to permit.
+#[test]
+fn a_settlement_costs_no_more_heap_than_the_capacity_model_assumes() {
+    /// `cost.md §7`: 216 B book key + 0.8 · 130 B birth + 1.8 · 121 B applied
+    /// ≈ 538 B per settlement, upper-bounded. This run folds settlements without
+    /// births, so it exercises the book-key + applied terms; the allowance stays
+    /// the full model figure because that is the number the cutover is planned on.
+    const MODELLED_BYTES_PER_SETTLEMENT: u64 = 538;
+    /// `heap_bytes` reads wasm **pages** (64 KiB), so the run has to allocate
+    /// several of them or the answer is "zero bytes each" — which is what a first
+    /// attempt at 200 settlements reported, and it is not a measurement, it is a
+    /// granularity artefact. At the modelled 538 B this is ~1 MB, i.e. ~16 pages.
+    const N: u64 = 4_000;
+
+    let (pic, indexer, mock) = setup_with_mock();
+    let stats = |pic: &PocketIc| -> StateStats {
+        Decode!(
+            &query(pic, indexer, "get_state_stats", Encode!().unwrap()),
+            StateStats
+        )
+        .unwrap()
+    };
+
+    let before = stats(&pic);
+    for i in 0..N {
+        // A fresh pair each time: the model's worst case is "every settlement is
+        // a new book key", and a repeated pair would measure the cheap path.
+        let mut donor = [2u8; 32];
+        donor[0..8].copy_from_slice(&i.to_le_bytes());
+        // Wallet donors only — an off-curve one would need a folded birth first
+        // (`attributable`), and this test is about bytes, not attribution.
+        if crown_derive::solana_is_off_curve(&donor) {
+            continue;
+        }
+        let mut recipient = [3u8; 32];
+        recipient[0..8].copy_from_slice(&i.to_le_bytes());
+        set_response(
+            &pic,
+            mock,
+            canned_response(donor, recipient, 500_000, 100 + i),
+        );
+        let sig = format!("cap-sig-{i}");
+        assert!(
+            matches!(
+                relay_ingest(&pic, mock, indexer, &sig),
+                IngestResult::Applied { settlements: 1, .. }
+            ),
+            "settlement {i} must fold"
+        );
+    }
+    let after = stats(&pic);
+
+    let folded = after.book_keys - before.book_keys;
+    let grew = after.heap_bytes - before.heap_bytes;
+    let per = grew / folded.max(1);
+    println!("[capacity] {folded} settlements → +{grew} B heap = {per} B each (model {MODELLED_BYTES_PER_SETTLEMENT})");
+    // 3 GiB of heap at the measured rate — the number `CUTOVER_SLOT` is planned on.
+    println!(
+        "[capacity] 3 GiB / {per} B ≈ {:.2}M settlements per generation",
+        (3.0 * 1024.0 * 1024.0 * 1024.0 / per as f64) / 1e6
+    );
+    assert!(
+        per <= MODELLED_BYTES_PER_SETTLEMENT,
+        "a settlement costs {per} B of heap, over the {MODELLED_BYTES_PER_SETTLEMENT} B the capacity \
+         model assumes — the generation fills sooner than `CUTOVER_SLOT` plans for, and the index \
+         is blackholed"
+    );
+}
+
+/// **The generation handover, across the canister boundary rather than inside one
+/// process.** `certified.rs` already pins the property in a unit test — a
+/// successor rebuilt from the pages reconstructs the same root. What that test
+/// cannot see is the half the cutover actually uses: the pages have to come out
+/// **through a query**, in candid, paginated by a cursor, and they have to come
+/// out *whole*. A `limit` that silently truncates a walk, or a cursor that skips a
+/// key, produces a successor whose root simply differs — with no error anywhere,
+/// on a predecessor that is blackholed and cannot be asked again.
+///
+/// This asserts the two properties that were measurable: **both enumerations
+/// cross the boundary complete** (against the gauge that schedules the cutover),
+/// and **each entry crosses faithfully** (against the point query for the same
+/// key). Both hold, with a deliberately small page size so the cursor is
+/// exercised rather than the "it all fit in one page" case.
+///
+/// **What it deliberately does not assert — and the reason is a finding, not an
+/// omission.** Rebuilding a successor from these pages and comparing its root to
+/// the predecessor's certificate matches while the history is settlements only,
+/// and **stops matching once births are in it** (measured: 18 book keys + 12
+/// births, both enumerations complete and faithful, rebuild order-independent,
+/// roots still differ). Since the pages are provably whole and faithful, the gap
+/// is in the rebuild contract rather than in the enumeration — and until it is
+/// understood, asserting a root equality here would either be red or be made
+/// green by fitting the test to the answer. `07-build-plan.md §P8` carries the
+/// evidence and the reproduction.
+#[test]
+fn both_enumerations_cross_the_canister_boundary_whole_and_faithful() {
+    /// Small on purpose — several pages per enumeration, so the cursor is
+    /// exercised rather than the "everything fits in one page" case.
+    const PAGE: u32 = 7;
+    const N: u64 = 40;
+
+    let (pic, indexer, mock) = setup_with_mock();
+
+    // A mixed history, folded through the real paid path: settlements from wallet
+    // donors (a fresh pair each, so every one is its own book key) plus births —
+    // the shape the cutover actually meets.
+    let mut folded = 0u64;
+    for i in 0..N {
+        let mut donor = [4u8; 32];
+        donor[0..8].copy_from_slice(&i.to_le_bytes());
+        if crown_derive::solana_is_off_curve(&donor) {
+            continue;
+        }
+        let mut recipient = [5u8; 32];
+        recipient[0..8].copy_from_slice(&i.to_le_bytes());
+        set_response(
+            &pic,
+            mock,
+            canned_response(donor, recipient, 300_000 + i, 500 + i),
+        );
+        if matches!(
+            relay_ingest(&pic, mock, indexer, &format!("ho-sig-{i}")),
+            IngestResult::Applied { settlements: 1, .. }
+        ) {
+            folded += 1;
+        }
+    }
+    assert!(folded > 0, "the handover needs a history to hand over");
+
+    for i in 0..12u8 {
+        let (ix, _escrow) = create_escrow_ix(Pubkey::new_from_array(WALLET_DONOR), [i; 32]);
+        set_response(
+            &pic,
+            mock,
+            canned(
+                &[ix],
+                Pubkey::new_from_array(WALLET_DONOR),
+                600 + u64::from(i),
+                true,
+            ),
+        );
+        assert!(
+            matches!(
+                relay_ingest(&pic, mock, indexer, &format!("ho-birth-{i}")),
+                IngestResult::Applied {
+                    births: 1,
+                    settlements: 0,
+                    ..
+                }
+            ),
+            "birth {i} must fold, and fold nothing else"
+        );
+    }
+
+    // ---- drain both enumerations over the boundary ----
+    let mut book: Vec<crown_indexer::BookEntry> = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = Decode!(
+            &query(
+                &pic,
+                indexer,
+                "get_book_page",
+                Encode!(&cursor, &PAGE).unwrap()
+            ),
+            Option<Vec<crown_indexer::BookEntry>>
+        )
+        .unwrap()
+        .expect("a valid cursor must not be refused");
+        if page.is_empty() {
+            break;
+        }
+        let last = page.last().expect("non-empty");
+        let mut key = Vec::with_capacity(96);
+        key.extend_from_slice(&last.chain);
+        key.extend_from_slice(&last.donor);
+        key.extend_from_slice(&last.recipient);
+        cursor = Some(key);
+        book.extend(page);
+    }
+
+    let mut births: Vec<crown_indexer::BirthEntry> = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = Decode!(
+            &query(
+                &pic,
+                indexer,
+                "get_births_page",
+                Encode!(&cursor, &PAGE).unwrap()
+            ),
+            Option<Vec<crown_indexer::BirthEntry>>
+        )
+        .unwrap()
+        .expect("a valid cursor must not be refused");
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(page.last().expect("non-empty").escrow.clone());
+        births.extend(page);
+    }
+
+    // 1. Complete — against the gauge the cutover is scheduled off. The failure
+    //    this catches is a walk that stops early and reads as finished.
+    let stats = Decode!(
+        &query(&pic, indexer, "get_state_stats", Encode!().unwrap()),
+        StateStats
+    )
+    .unwrap();
+    assert_eq!(
+        book.len() as u64,
+        stats.book_keys,
+        "the paged walk handed over {} of {} book keys",
+        book.len(),
+        stats.book_keys
+    );
+    assert_eq!(
+        births.len() as u64,
+        stats.births,
+        "the paged walk handed over {} of {} births",
+        births.len(),
+        stats.births
+    );
+    assert!(
+        book.len() > PAGE as usize && births.len() > PAGE as usize,
+        "both enumerations must span several pages, or the cursor is untested"
+    );
+
+    // 2. Faithful — every entry equals what the point query says for the same key.
+    //    A mangled field would rebuild a successor that is wrong rather than short.
+    for e in &births {
+        let (direct, _w) = Decode!(
+            &query(&pic, indexer, "get_birth", Encode!(&e.escrow).unwrap()),
+            Option<crown_indexer::BirthView>,
+            Vec<u8>
+        )
+        .unwrap();
+        let d = direct.expect("an enumerated escrow must also be queryable");
+        assert_eq!(
+            (d.donor, d.slot),
+            (e.donor.clone(), e.slot),
+            "birth entry differs from the point query"
+        );
+    }
+    for e in &book {
+        let (rep, _w) = Decode!(
+            &query(
+                &pic,
+                indexer,
+                "get_reputation",
+                Encode!(&e.chain, &e.donor, &e.recipient).unwrap()
+            ),
+            Nat,
+            Vec<u8>
+        )
+        .unwrap();
+        assert_eq!(rep, e.reputation, "book entry differs from the point query");
+    }
+
+    println!(
+        "[handover] {} book keys + {} births crossed whole in pages of {PAGE}, each matching its point query",
+        book.len(),
+        births.len()
+    );
 }

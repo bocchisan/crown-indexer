@@ -70,7 +70,7 @@ const _: () = assert!(
 /// refunding the unused part, one ingest still could not cost more than it
 /// charged (non-negativity invariant #1 without an assumption about the callee).
 /// An order of magnitude over any measured ingest execution.
-const EXECUTION_RESERVE: u128 = 1_000_000_000;
+pub const EXECUTION_RESERVE: u128 = 1_000_000_000;
 
 // Non-negativity invariant #1, as a *compile-time* law rather than a test: an
 // ingest may never cost the index more than it charged, and must attach enough
