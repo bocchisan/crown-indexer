@@ -287,28 +287,39 @@ impl Certified {
     /// carries the wrong key forward untouched. Misattribution therefore costs a
     /// full recompute of chain history — never assume it heals itself.
     ///
-    /// What actually holds the ordering is the settle path, not slot order. A
-    /// `Settled` whose donor is an escrow can only arise from `claim(settle)`
-    /// (`crown-factory`, form `two-outcome`: `cancel` and `refund` return to the
-    /// donor and reach the splitter not at all), and `claim` demands an ed25519
-    /// verdict signed by the escrow's `resolver`. That signature exists only after
-    /// a game materialized the scope on a **birth proof** — a witness against a
-    /// certified index root, i.e. the birth was already folded here. So the birth
-    /// precedes the settlement because the money cannot move until it does.
+    /// **The ordering is enforced, not assumed** — `state::attributable` refuses
+    /// the whole transaction when a settlement's payer is off-curve (so: a PDA,
+    /// so: an escrow) and has no recorded birth. Nothing is folded, nothing is
+    /// marked, and the same signature folds correctly once the birth is in. So
+    /// this function is never reached with an escrow it does not know.
     ///
-    /// Two things this does *not* cover, both deliberate:
+    /// It is written that way because the argument that used to stand here — "the
+    /// settle path holds the order: a `Settled` from an escrow can only come from
+    /// `claim(settle)`, which needs the scope's resolver signature, which exists
+    /// only after a game materialized the scope on a birth proof" — is true only
+    /// for a scope holding exactly one escrow. Read narrowly, it says a signature
+    /// exists after *a* birth proof; the signature is per **scope**, and it opens
+    /// every escrow that derived that resolver. Three cases fell outside it, and
+    /// they are the reason the gate exists rather than a paragraph:
+    /// - **A scope holding more than one escrow (`B=N`)**, which is in the first
+    ///   release. `conditional-funding` materializes on the birth proof of the
+    ///   *first* contribution; contributions 2..N join by deriving the resolver and
+    ///   never touch the canister. Adversarially reachable, too: `claim` is
+    ///   permissionless once the verdict signature is public, so anyone could
+    ///   settle a stranger's contribution and fold that settlement first — burning
+    ///   a real donor's reputation for the price of one ingest.
     /// - An escrow whose `resolver` is its creator's own key needs no game and no
-    ///   birth proof; the creator can settle it themselves. That is self-inflicted
-    ///   — their money, and the reputation they lose lands on the escrow PDA, which
-    ///   is off-curve and so can never collide with anyone's wallet.
-    /// - A form whose settle path is *not* signature-gated. Form `stream` is
-    ///   exactly that (`release` is permissionless and schedule-gated), which is
-    ///   why it is not in the mainnet perimeter (`config/mainnet.toml`,
-    ///   `08-deferred.md`). Adding such a form back means this paragraph stops
-    ///   being true and the ordering becomes the pusher's obligation instead.
+    ///   birth proof; the creator can settle it themselves.
+    /// - A form whose settle path is not signature-gated at all (`stream`'s
+    ///   `release` is permissionless and schedule-gated). That is no longer a
+    ///   reason to keep such a form out of the perimeter — the gate covers it —
+    ///   but `stream` stays out for the reason that has not changed: it has no
+    ///   consumer (`08-deferred.md`).
     ///
-    /// The fold stays order-simple on purpose: no reverse index, no deferral, no
-    /// re-attribution.
+    /// The fold itself stays order-simple on purpose: no reverse index, no
+    /// deferral, no re-attribution. The gate is what buys that simplicity — it
+    /// turns the one ordering mistake this design cannot survive into a refusal
+    /// anyone can clear.
     pub fn attribute(&self, event: Settled) -> Settled {
         match self.birth(&event.donor) {
             Some(b) => Settled {

@@ -29,6 +29,25 @@ const TOKEN_PROGRAM: [u8; 32] = [
 ];
 const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
+/// A donor address a private key could exist for. Every wallet address is an
+/// ed25519 public key, therefore **on** the curve — and the fold now refuses a
+/// settlement whose payer is **off** it and has no recorded birth, because such an
+/// address can only be an escrow this index has not seen born
+/// (`state::attributable`). Roughly half of all byte patterns are off the curve,
+/// so a donor picked by eye would silently exercise the wrong branch: asserted
+/// below rather than assumed.
+const WALLET_DONOR: [u8; 32] = [1u8; 32];
+
+/// The fixture above really is wallet-shaped. Cheap, and it fails loudly the day
+/// someone edits the constant to a prettier number.
+#[test]
+fn the_donor_fixture_is_a_possible_public_key() {
+    assert!(
+        !crown_derive::solana_is_off_curve(&WALLET_DONOR),
+        "a direct donation comes from a wallet — this fixture must be on-curve"
+    );
+}
+
 fn indexer_wasm() -> Vec<u8> {
     build_indexer_wasm("testnet", "target")
 }
@@ -444,7 +463,7 @@ fn reputation(pic: &PocketIc, indexer: Principal, donor: [u8; 32], recipient: [u
 #[test]
 fn paid_ingest_folds_a_settlement_into_reputation() {
     let (pic, indexer, mock) = setup_with_mock();
-    let donor = [7u8; 32];
+    let donor = WALLET_DONOR;
     let recipient = [8u8; 32];
     let gross = 500_000u64;
     set_response(&pic, mock, canned_response(donor, recipient, gross, 123));
@@ -511,7 +530,7 @@ fn an_underpaid_inter_canister_ingest_makes_no_outcall() {
     set_response(
         &pic,
         mock,
-        canned_response([7u8; 32], [8u8; 32], 500_000, 123),
+        canned_response(WALLET_DONOR, [8u8; 32], 500_000, 123),
     );
 
     let res = relay_ingest_with(
@@ -548,14 +567,14 @@ fn an_underpaid_inter_canister_ingest_makes_no_outcall() {
 #[test]
 fn a_reverted_transaction_is_retired_not_retried() {
     let (pic, indexer, mock) = setup_with_mock();
-    let donor = Pubkey::new_from_array([7u8; 32]);
+    let donor = Pubkey::new_from_array(WALLET_DONOR);
     set_response(
         &pic,
         mock,
         canned(
             &[
                 transfer_ix(500_000, donor),
-                settled_ix([7u8; 32], [8u8; 32], 500_000),
+                settled_ix(WALLET_DONOR, [8u8; 32], 500_000),
             ],
             donor,
             123,
@@ -578,7 +597,7 @@ fn a_reverted_transaction_is_retired_not_retried() {
     assert_eq!(counter(&pic, indexer, "get_applied_count"), 1);
     // Its `Settled` was never folded — the transaction reverted, so no money moved.
     assert_eq!(
-        reputation(&pic, indexer, [7u8; 32], [8u8; 32]),
+        reputation(&pic, indexer, WALLET_DONOR, [8u8; 32]),
         Nat::from(0u8)
     );
 
@@ -588,6 +607,78 @@ fn a_reverted_transaction_is_retired_not_retried() {
     assert_eq!(calls(&pic, mock), 1);
 }
 
+/// The other half of that distinction, and the one no test used to run: a read
+/// that did **not** land keeps the payment and leaves the signature exactly as it
+/// found it.
+///
+/// `01-standards §Тесты 12` asks for this one by name — "сколько угодно провалов
+/// подряд не делают сигнатуру невписываемой" — and it is the property the whole
+/// no-attempt-budget decision rests on. `commitment = finalized` makes a
+/// not-yet-final transaction indistinguishable here from an unreadable one, so a
+/// signature that failed N reads has to still fold on the N+1st; if it did not,
+/// anyone could retire someone else's payment for the price of the reads, forever,
+/// on a canister nobody can patch. Nothing checked it: the unit test named for the
+/// property only calls `mark_applied`, and `NotFound` was never produced end to
+/// end at all.
+///
+/// The payment is the other direction of the same edge (`§Тесты 4`): the outcall
+/// happened, so `INGEST_PRICE` is kept even though nothing was folded — fund-then-
+/// fail must not be cheaper than the work it triggers.
+#[test]
+fn a_read_that_failed_keeps_the_payment_and_leaves_the_signature_foldable() {
+    let (pic, indexer, mock) = setup_with_mock();
+    let donor = WALLET_DONOR;
+    let recipient = [8u8; 32];
+    let gross = 500_000u64;
+
+    // Both shapes of "unreadable", in the order a real signature meets them: no
+    // finalized transaction under consensus yet, and a provider-side error.
+    let not_found = Encode!(&MultiGetTransactionResult::Consistent(
+        GetTransactionResult::Ok(None)
+    ))
+    .unwrap();
+    let errored = Encode!(&MultiGetTransactionResult::Consistent(
+        GetTransactionResult::Err(Reserved)
+    ))
+    .unwrap();
+
+    for (attempt, reply) in [&not_found, &errored, &not_found, &errored, &not_found]
+        .into_iter()
+        .enumerate()
+    {
+        set_response(&pic, mock, reply.clone());
+        let before = pic.cycle_balance(indexer);
+        let res = relay_ingest(&pic, mock, indexer, "sig-unreadable");
+        assert!(matches!(res, IngestResult::NotFound), "got {res:?}");
+
+        // Paid, and the payment bought a real attempt: the outcall was made.
+        assert!(
+            pic.cycle_balance(indexer) > before,
+            "a failed read keeps INGEST_PRICE — it is not refunded"
+        );
+        assert_eq!(calls(&pic, mock), attempt as u64 + 1);
+
+        // And it changed nothing: `applied` is the only terminal state a signature
+        // has, so no amount of failure can retire one.
+        assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+        assert_eq!(counter(&pic, indexer, "get_anomaly_count"), 0);
+    }
+
+    // The transaction finally reads. The signature was never consumed by the five
+    // failures — that is exactly what "stays foldable forever" has to mean.
+    set_response(&pic, mock, canned_response(donor, recipient, gross, 123));
+    let res = relay_ingest(&pic, mock, indexer, "sig-unreadable");
+    assert!(
+        matches!(res, IngestResult::Applied { settlements: 1, .. }),
+        "five failed reads must not retire a signature: got {res:?}"
+    );
+    assert_eq!(
+        reputation(&pic, indexer, donor, recipient),
+        Nat::from(gross)
+    );
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 1);
+}
+
 /// The attribution chain end to end (architecture §4), across two ingests: a
 /// birth records `escrow → donor`, and a later settlement whose on-chain donor is
 /// that escrow is credited to the funding donor instead of to the escrow address.
@@ -595,7 +686,7 @@ fn a_reverted_transaction_is_retired_not_retried() {
 #[test]
 fn an_escrow_settlement_is_credited_to_its_funding_donor() {
     let (pic, indexer, mock) = setup_with_mock();
-    let donor = Pubkey::new_from_array([7u8; 32]);
+    let donor = Pubkey::new_from_array(WALLET_DONOR);
     let recipient = [8u8; 32];
     let gross = 500_000u64;
 
@@ -679,6 +770,107 @@ fn an_escrow_settlement_is_credited_to_its_funding_donor() {
     assert_eq!(reputation(&pic, indexer, escrow, recipient), Nat::from(0u8));
 }
 
+/// The other end of that chain, and the one that used to have no answer at all:
+/// the settlement arrives **first**, before the index has seen the escrow born.
+///
+/// It is not a corner case. A scope's verdict signature opens every escrow that
+/// derived its resolver — including escrows the game never saw, which is exactly
+/// how a collection takes its contributions past the first
+/// (`crown-games/conditional-funding`). Folding such a settlement would credit the
+/// escrow **address** for good: the law only adds, so a birth arriving later does
+/// not reach back, and the donor's reputation for a real payment is gone. Worse,
+/// anyone could cause it deliberately for the price of one ingest.
+///
+/// So the fold refuses, and refusing has to be *free of consequence*: nothing
+/// folded, nothing counted, the signature not marked. The very same signature then
+/// folds correctly once the birth is in — no second chance needed, because the
+/// first one was never spent.
+#[test]
+fn a_settlement_that_outran_its_birth_is_refused_and_folds_after_it() {
+    let (pic, indexer, mock) = setup_with_mock();
+    let donor = Pubkey::new_from_array(WALLET_DONOR);
+    let recipient = [8u8; 32];
+    let gross = 500_000u64;
+
+    let (birth_ix, escrow) = create_escrow_ix(donor, [42u8; 32]);
+    let escrow_pk = Pubkey::new_from_array(escrow);
+    let settle = canned(
+        &[
+            transfer_ix(gross, escrow_pk),
+            settled_ix(escrow, recipient, gross),
+        ],
+        escrow_pk,
+        200,
+        true,
+    );
+
+    // 1. The settlement, ingested before the birth.
+    set_response(&pic, mock, settle.clone());
+    let res = relay_ingest(&pic, mock, indexer, "sig-settle");
+    assert!(matches!(res, IngestResult::UnknownBirth), "got {res:?}");
+
+    // Nothing moved — not the book, not the counters, not `applied`.
+    assert_eq!(reputation(&pic, indexer, escrow, recipient), Nat::from(0u8));
+    assert_eq!(
+        reputation(&pic, indexer, donor.to_bytes(), recipient),
+        Nat::from(0u8)
+    );
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+    assert_eq!(counter(&pic, indexer, "get_anomaly_count"), 0);
+
+    // Repeating it changes nothing either: a refusal is not a spent attempt.
+    set_response(&pic, mock, settle.clone());
+    let again = relay_ingest(&pic, mock, indexer, "sig-settle");
+    assert!(matches!(again, IngestResult::UnknownBirth), "got {again:?}");
+    assert_eq!(counter(&pic, indexer, "get_applied_count"), 0);
+
+    // 2. The birth lands (an earlier slot, as it was on chain all along).
+    set_response(&pic, mock, canned(&[birth_ix], donor, 100, true));
+    let res = relay_ingest(&pic, mock, indexer, "sig-birth");
+    assert!(
+        matches!(res, IngestResult::Applied { births: 1, .. }),
+        "got {res:?}"
+    );
+
+    // 3. …and the very same settlement signature now folds, to the human.
+    set_response(&pic, mock, settle);
+    let res = relay_ingest(&pic, mock, indexer, "sig-settle");
+    assert!(
+        matches!(res, IngestResult::Applied { settlements: 1, .. }),
+        "the refused signature was never spent: got {res:?}"
+    );
+    assert_eq!(
+        reputation(&pic, indexer, donor.to_bytes(), recipient),
+        Nat::from(gross)
+    );
+    assert_eq!(reputation(&pic, indexer, escrow, recipient), Nat::from(0u8));
+}
+
+/// A wallet needs no birth, and that is what keeps the refusal narrow: a direct
+/// donation is paid by a transaction-level signer, whose address is on the curve
+/// by construction. If the check had been "no birth → refuse", every direct
+/// donation in the system would have stopped folding.
+#[test]
+fn a_direct_donation_from_a_wallet_still_folds_with_no_birth_anywhere() {
+    let (pic, indexer, mock) = setup_with_mock();
+    let recipient = [8u8; 32];
+    let gross = 500_000u64;
+    set_response(
+        &pic,
+        mock,
+        canned_response(WALLET_DONOR, recipient, gross, 123),
+    );
+    let res = relay_ingest(&pic, mock, indexer, "sig-direct");
+    assert!(
+        matches!(res, IngestResult::Applied { settlements: 1, .. }),
+        "got {res:?}"
+    );
+    assert_eq!(
+        reputation(&pic, indexer, WALLET_DONOR, recipient),
+        Nat::from(gross)
+    );
+}
+
 /// The generation boundary (architecture §8, handoff mechanism #1), on a build
 /// that actually has one. `cutover_slot = 0` in both shipped profiles, so without
 /// this profile the `AfterCutover` branch is dead code in every buildable
@@ -688,7 +880,7 @@ fn an_escrow_settlement_is_credited_to_its_funding_donor() {
 fn after_cutover_is_refused_without_spending_the_signature() {
     let wasm = build_indexer_wasm("cutover", "target/profile-cutover");
     let (pic, indexer, mock) = setup_with_mock_wasm(wasm);
-    let donor = [7u8; 32];
+    let donor = WALLET_DONOR;
     let recipient = [8u8; 32];
     let gross = 500_000u64;
 

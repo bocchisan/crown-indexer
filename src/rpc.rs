@@ -80,11 +80,11 @@ pub async fn fetch(signature: String) -> Option<TransactionReply> {
             // `None` the queried count is whatever the default set holds — three
             // — so `min: 3` becomes 3-of-3: a single flaky provider fails every
             // read, and every ingest is charged for a settlement that never lands.
-            // Naming the total
-            // buys `CONSENSUS`-of-`RPC_PROVIDERS` (3-of-5 today, two failures
-            // tolerated) and makes the cost model honest — it prices exactly the
-            // providers this now asks for. `build.rs` gates
-            // `CONSENSUS <= RPC_PROVIDERS <= 255`.
+            // Naming the total buys `CONSENSUS`-of-`RPC_PROVIDERS` (3-of-5 today,
+            // two failures tolerated) and makes the cost model honest — it prices
+            // exactly the providers this now asks for. The shape
+            // (`3 <= CONSENSUS < RPC_PROVIDERS <= 255`) is a `const _: ()` in
+            // `config.rs`, checked on the constants that reached the code.
             total: Some(RPC_PROVIDERS as u8),
             min: CONSENSUS,
         }),

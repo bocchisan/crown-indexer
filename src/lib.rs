@@ -78,6 +78,20 @@ pub enum IngestResult {
     /// retriable here: the payment is kept (the outcall was made), but the
     /// signature stays free for the successor to fold.
     AfterCutover,
+    /// The transaction settles an address with no private key whose birth this
+    /// index has not recorded — an escrow it has never seen born. Folding it
+    /// would credit the escrow **address** rather than the person who funded it,
+    /// silently and forever (the law only adds). So nothing is folded and nothing
+    /// is marked: the payment is kept, the signature stays free, and the fix is in
+    /// the caller's hands — fold that escrow's birth (`create_escrow`
+    /// transaction), then submit this signature again.
+    ///
+    /// Ordinary in exactly one place: a scope whose verdict signature opens more
+    /// escrows than the game ever saw (`crown-games/conditional-funding` — a
+    /// collection's contributions past the first). Before this answer existed,
+    /// that case lost the donor's reputation permanently instead
+    /// (`state::attributable`).
+    UnknownBirth,
 }
 
 /// One enumerated birth, for the successor generation's seed (`get_births_page`).
@@ -247,14 +261,17 @@ async fn ingest(signature: String) -> IngestResult {
     }
     match parse::parse(&reply) {
         Some(parse::Parsed::Executed(tx)) => match state::apply(sig_bytes, &tx) {
-            Some(a) => IngestResult::Applied {
+            state::Folded::Applied(a) => IngestResult::Applied {
                 settlements: a.settlements,
                 births: a.births,
                 anomalies: a.anomalies,
             },
             // Already applied — a concurrent ingest of the same signature got
             // there first. Above all: not folded twice.
-            None => IngestResult::Duplicate,
+            state::Folded::Duplicate => IngestResult::Duplicate,
+            // An escrow settled before this index saw it born. Nothing folded,
+            // nothing marked — fold the birth and resubmit (`state::attributable`).
+            state::Folded::UnknownBirth => IngestResult::UnknownBirth,
         },
         // Read fine; the chain says it reverted. Finalized and permanent, so it is
         // retired rather than left retriable: nothing is wrong with the read, and

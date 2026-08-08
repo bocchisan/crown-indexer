@@ -8,7 +8,7 @@
 use crate::certified::{Birth, Certified};
 use crate::config::chain_config;
 use crate::recognize::{recognize, Tx};
-use crown_reduce::ChainId;
+use crown_reduce::{ChainId, Settled};
 use ic_certified_map::HashTree;
 use std::cell::RefCell;
 
@@ -22,6 +22,18 @@ pub struct Applied {
     pub settlements: u64,
     pub births: u64,
     pub anomalies: u64,
+}
+
+/// The outcome of folding one paid transaction.
+#[derive(Clone, Copy, Debug)]
+pub enum Folded {
+    Applied(Applied),
+    /// Already folded in — exactly-once refused this copy.
+    Duplicate,
+    /// The transaction settles an address with **no private key** whose birth
+    /// this index has not recorded. Nothing is folded and nothing is marked:
+    /// fold the birth, then submit this signature again ([`attributable`]).
+    UnknownBirth,
 }
 
 /// Whether a signature has already been folded in — the whole of exactly-once,
@@ -117,25 +129,83 @@ pub fn recertify() {
     STATE.with_borrow(|s| ic_cdk::api::certified_data_set(s.combined_root()));
 }
 
+/// Whether a recognized settlement can be credited to the wallet that paid it.
+///
+/// **This is what enforces the ordering "birth before settlement" — nothing else
+/// does.** `Certified::attribute` maps an escrow to its funding donor by looking
+/// the escrow up in the births tree; a settlement folded before that birth lands
+/// is credited to the escrow address instead, silently and **permanently** (the
+/// law only adds — there is no debit and no re-attribution, architecture §5).
+///
+/// The test is the payer's own shape, and it needs no per-form knowledge. A
+/// `Settled.donor` is either a transaction-level signer — an ed25519 public key,
+/// therefore **on** the curve — or a PDA that signed through a CPI, therefore
+/// **off** it (`crown_derive::solana_is_off_curve`, the same predicate the
+/// address derivation itself applies). So:
+///
+/// - on-curve → a wallet paid; the event's donor is the donor. Folds.
+/// - off-curve **with** a recorded birth (this index's, or one born in this very
+///   transaction) → an escrow paid; attribution knows whose. Folds.
+/// - off-curve **without** one → an address that can never hold a key and that
+///   this index cannot attribute. Refused: the transaction is left unfolded, the
+///   signature unmarked, and whoever wants the reputation folds the birth first
+///   and resubmits.
+///
+/// Why refusing beats folding-to-the-escrow. The failure it replaces was the
+/// worst kind the book has — silent, permanent, and reachable by anyone for the
+/// price of one ingest: a scope's verdict signature opens **every** escrow that
+/// derived its resolver, including ones the game never saw (a collection's second
+/// contribution — `crown-games/conditional-funding`), so an adversary could
+/// settle such an escrow and fold that settlement first, burning a real donor's
+/// reputation for ≈$0.02. It is now a transient: refusal writes nothing, so the
+/// same signature is still foldable by anyone, forever. Censorship is not the
+/// mirror risk — clearing the refusal is permissionless too (fold the birth), so
+/// no party can hold another's settlement hostage.
+///
+/// What it costs: a settlement from a keyless payer that is *not* one of our
+/// escrows (a third-party program donating through the splitter with a PDA
+/// authority) stops folding. That is deliberate — reputation under a key nobody
+/// holds is not reputation, and the book's key is a wallet (`00 §2`).
+fn attributable(s: &Certified, births_in_tx: &[([u8; 32], Birth)], ev: &Settled) -> bool {
+    if !crown_derive::solana_is_off_curve(&ev.donor) {
+        return true; // a wallet paid: the event's donor is the donor
+    }
+    s.birth(&ev.donor).is_some() || births_in_tx.iter().any(|(escrow, _)| *escrow == ev.donor)
+}
+
 /// Recognize, attribute, fold, record, mark applied, and re-certify — the whole
 /// state mutation for one paid transaction. Births are recorded before
 /// settlements so a same-tx settlement can attribute to a same-tx escrow; the
-/// cross-tx ordering invariant (birth's slot precedes its settlement's) is
-/// documented on `Certified::attribute`.
+/// cross-tx ordering invariant (the birth is folded before its settlement) is
+/// enforced by [`attributable`], which refuses the transaction outright rather
+/// than let a settlement be credited to an address instead of a person.
 ///
-/// `None` if the signature is already applied — and that check is the whole of
-/// exactly-once: it happens here, inside the same synchronous mutation that sets
-/// `applied`, so no two ingests of one signature can both fold however they
+/// `Duplicate` if the signature is already applied — and that check is the whole
+/// of exactly-once: it happens here, inside the same synchronous mutation that
+/// sets `applied`, so no two ingests of one signature can both fold however they
 /// raced. Folding twice would double the reputation a settlement proves for the
 /// price of one ingest.
-pub fn apply(signature: Vec<u8>, tx: &Tx) -> Option<Applied> {
+///
+/// Refusal is all-or-nothing, and deliberately so: a transaction carrying several
+/// settlements (a batched claim) is folded whole or not at all, because a partial
+/// fold would mark the signature applied and retire the settlements it skipped.
+pub fn apply(signature: Vec<u8>, tx: &Tx) -> Folded {
     if STATE.with_borrow(|s| s.is_applied(&signature)) {
-        return None;
+        return Folded::Duplicate;
     }
     let cfg = chain_config();
     let recognized = recognize(tx, &cfg);
 
     STATE.with_borrow_mut(|s| {
+        // Before any mutation, including the anomaly counter: a refused
+        // transaction must leave this canister exactly as it found it.
+        if recognized
+            .settlements
+            .iter()
+            .any(|ev| !attributable(s, &recognized.births, ev))
+        {
+            return Folded::UnknownBirth;
+        }
         let mut anomalies = recognized.anomalies;
         s.add_anomalies(recognized.anomalies);
         let mut births = 0u64;
@@ -161,10 +231,101 @@ pub fn apply(signature: Vec<u8>, tx: &Tx) -> Option<Applied> {
         // Empty signatures are never marked; then publish the new combined root.
         s.mark_applied(signature);
         ic_cdk::api::certified_data_set(s.combined_root());
-        Some(Applied {
+        Folded::Applied(Applied {
             settlements,
             births,
             anomalies,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settled(donor: [u8; 32]) -> Settled {
+        Settled {
+            chain: ChainId([1u8; 32]),
+            donor,
+            recipient: [2u8; 32],
+            gross: 500_000,
+        }
+    }
+
+    /// A canonical PDA — off the curve by construction, which is exactly the
+    /// shape of every escrow address.
+    fn pda(salt: [u8; 32]) -> [u8; 32] {
+        let (addr, _bump) = crown_derive::solana_pda_address([9u8; 32], &[b"escrow", &salt])
+            .expect("a canonical bump exists");
+        addr
+    }
+
+    /// An address a private key could exist for — the shape of every wallet.
+    /// Asserted rather than assumed: roughly half of all byte patterns are off
+    /// the curve, so a fixture picked by eye would quietly exercise the *other*
+    /// branch and the test would pass for the wrong reason.
+    fn wallet() -> [u8; 32] {
+        let w = [1u8; 32];
+        assert!(
+            !crown_derive::solana_is_off_curve(&w),
+            "this fixture must be a possible public key"
+        );
+        w
+    }
+
+    #[test]
+    fn a_wallet_payer_needs_no_birth() {
+        let s = Certified::new();
+        assert!(attributable(&s, &[], &settled(wallet())));
+    }
+
+    /// The case the check exists for: an escrow settles and its birth is not in.
+    /// Folding here would credit the escrow address forever, so it is refused —
+    /// and the refusal clears the moment the birth lands.
+    #[test]
+    fn a_keyless_payer_without_a_birth_is_refused_until_the_birth_lands() {
+        let mut s = Certified::new();
+        let escrow = pda([42u8; 32]);
+        assert!(!attributable(&s, &[], &settled(escrow)));
+
+        s.record_birth(
+            escrow,
+            Birth {
+                donor: [7u8; 32],
+                slot: 1,
+            },
+        );
+        assert!(attributable(&s, &[], &settled(escrow)));
+    }
+
+    /// A birth born in the same transaction counts: `apply` records births before
+    /// settlements, so a create-and-claim batch must not refuse itself.
+    #[test]
+    fn a_birth_in_the_same_transaction_counts() {
+        let s = Certified::new();
+        let escrow = pda([1u8; 32]);
+        let births = [(
+            escrow,
+            Birth {
+                donor: [7u8; 32],
+                slot: 5,
+            },
+        )];
+        assert!(!attributable(&s, &[], &settled(escrow)));
+        assert!(attributable(&s, &births, &settled(escrow)));
+    }
+
+    /// A recorded birth for *another* escrow proves nothing about this one.
+    #[test]
+    fn another_escrows_birth_does_not_admit_this_one() {
+        let mut s = Certified::new();
+        s.record_birth(
+            pda([1u8; 32]),
+            Birth {
+                donor: [7u8; 32],
+                slot: 1,
+            },
+        );
+        assert!(!attributable(&s, &[], &settled(pda([2u8; 32]))));
+    }
 }

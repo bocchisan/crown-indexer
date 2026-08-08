@@ -15,7 +15,7 @@ ingest_price       = 17_000_000_000       # циклы (≈$0.0232), ≥ цен�
 min_gross          = 200_000              # $0.20 в minor units (USDC 6 знаков)
 cycle_floor        = 1_000_000_000_000    # пол баланса циклов
 
-# Размер outcall'а; `build.rs` проверяет согласованность (см. mainnet-профиль).
+# Размер outcall'а; `config.rs` проверяет согласованность (см. mainnet-профиль).
 rpc_nodes          = 34                   # размер подсети SOL RPC-канистры (fiduciary)
 rpc_providers      = 5                    # опрашиваемых провайдеров (платим за всех)
 rpc_request_bytes  = 1_000                # верхняя оценка тела запроса
@@ -30,7 +30,7 @@ attach_cycles      = 15_000_000_000       # ≥ 2× измеренной цен�
 # с запасом, а не цель, около которой надо сидеть. Авторитетное число даёт
 # бесплатный `getTransactionCyclesCost` самой канистры; cost-gate (P8) пиннит
 # `attach_cycles` по нему, а модель здесь лишь ловит несогласованный конфиг на
-# сборке. `build.rs` требует `2·worst_case ≤ attach_cycles ≤ ingest_price − 1e9`.
+# сборке. `config.rs` требует `2·worst_case ≤ attach_cycles ≤ ingest_price − 1e9`.
 #
 # `rpc_providers` — не только вход модели: индекс шлёт его как `total` в
 # `ConsensusStrategy::Threshold`, то есть спрашивает ровно столько провайдеров.

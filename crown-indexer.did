@@ -39,6 +39,20 @@ type IngestResult = variant {
   // A transaction that was read and simply reverted is not this: it is
   // `Applied` with zero counts.
   NotFound;
+  // The transaction settles an address with no private key whose birth this
+  // index has not recorded — an escrow it has never seen born. Folding it
+  // would credit the escrow **address** rather than the person who funded it,
+  // silently and forever (the law only adds). So nothing is folded and nothing
+  // is marked: the payment is kept, the signature stays free, and the fix is in
+  // the caller's hands — fold that escrow's birth (`create_escrow`
+  // transaction), then submit this signature again.
+  // 
+  // Ordinary in exactly one place: a scope whose verdict signature opens more
+  // escrows than the game ever saw (`crown-games/conditional-funding` — a
+  // collection's contributions past the first). Before this answer existed,
+  // that case lost the donor's reputation permanently instead
+  // (`state::attributable`).
+  UnknownBirth;
   // The transaction sits at or past `CUTOVER_SLOT` — it belongs to the next
   // generation's book, not this one's (architecture §8). Not an error and not
   // retriable here: the payment is kept (the outcall was made), but the

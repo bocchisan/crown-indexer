@@ -112,11 +112,13 @@ struct Transfer {
 /// A consumed slot is emptied so no transfer backs two events; returns whether a
 /// match was found. Reputation can never exceed really-moved money.
 ///
-/// The transfer's *destination* is deliberately not matched. It cannot be: the
-/// splitter's `donate` moves `gross` from the donor's ATA to the recipient's,
-/// but a settlement reaching it through an escrow has already had its fee split
-/// off by the escrow's own transfer, so "the address the money landed on" is not
-/// a fixed function of the event. What makes that safe is upstream of this check:
+/// The transfer's *destination* is deliberately not matched, because it cannot
+/// be: the instruction carries the destination **token account**, while the event
+/// carries that account's **owner** (`recipient_ata.owner`), and the splitter
+/// accepts any token account of the mint — not only the canonical ATA — so the one
+/// is not derivable from the other. Closing the gap would take a `getAccountInfo`
+/// per settlement, and this repo reads no account state at all. What makes that
+/// safe is upstream of this check:
 /// a `Settled` is only considered at all when the emitting program is the pinned
 /// splitter, and the splitter emits it exclusively after its own
 /// `transfer_checked` — so the event already implies a real transfer, and this

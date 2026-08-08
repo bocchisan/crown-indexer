@@ -106,15 +106,17 @@ const _: () = assert!(
      silently and unfixably, over-attaching is refunded"
 );
 // The threshold is asked of exactly `RPC_PROVIDERS` providers — `rpc.rs` states
-// `total` rather than letting the canister default it. Strictly fewer than the
-// providers queried, because `min == total` is unanimity, not a threshold: one
-// flaky provider would fail every read, and every ingest would be paid for
-// nothing until it recovered. And ≤255 because `total` is a `nat8` on the wire.
+// `total` rather than letting the canister default it, and `total` is a `nat8` on
+// the wire, so the count has to fit one.
 const _: () = assert!(
-    CONSENSUS as u128 <= RPC_PROVIDERS && RPC_PROVIDERS <= 255,
-    "the consensus threshold must be reachable within the providers queried, and \
-     the provider count must fit the `total : opt nat8` the SOL RPC canister takes"
+    RPC_PROVIDERS <= 255,
+    "the provider count must fit the `total : opt nat8` the SOL RPC canister takes"
 );
+// Strictly fewer than the providers queried, because `min == total` is unanimity,
+// not a threshold: one flaky provider would fail every read, and every ingest would
+// be paid for nothing until it recovered. This subsumes `CONSENSUS <= RPC_PROVIDERS`,
+// which is why that is not asserted beside it — a check that cannot go red before
+// another one is worse than no check at all (`07-build-plan.md §P7.13`).
 const _: () = assert!(
     (CONSENSUS as u128) < RPC_PROVIDERS,
     "querying exactly `consensus` providers is unanimity: a single flaky provider \
@@ -196,13 +198,11 @@ mod tests {
         h.finalize().into()
     }
 
-    /// Non-negativity invariant #1 is enforced twice at compile time (`build.rs`
-    /// on the config it bakes, `const _: ()` on the constants that reached the
-    /// code), so nothing is left for a runtime test to catch. What is worth
-    /// pinning here is the *model itself*: if the formula is ever edited, this
-    /// says what number it used to produce.
-    /// Both models, pinned to the numbers they produced when they were measured —
-    /// so an edit to either formula says what it changed.
+    /// Non-negativity invariant #1 is enforced by the `const _: ()` laws above, on
+    /// the constants that reached the code, so nothing is left for a runtime test
+    /// to catch. What is worth pinning here is the *model itself*: both formulas,
+    /// at the numbers they produced when they were measured, so that an edit to
+    /// either one says what it changed.
     ///
     /// The gap between them is the point: the IC's published outcall price is the
     /// floor (what the SOL RPC canister pays), the tariff is what it charges. The
