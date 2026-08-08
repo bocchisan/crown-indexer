@@ -1053,16 +1053,17 @@ fn a_settlement_costs_no_more_heap_than_the_capacity_model_assumes() {
 /// key). Both hold, with a deliberately small page size so the cursor is
 /// exercised rather than the "it all fit in one page" case.
 ///
-/// **What it deliberately does not assert — and the reason is a finding, not an
-/// omission.** Rebuilding a successor from these pages and comparing its root to
-/// the predecessor's certificate matches while the history is settlements only,
-/// and **stops matching once births are in it** (measured: 18 book keys + 12
-/// births, both enumerations complete and faithful, rebuild order-independent,
-/// roots still differ). Since the pages are provably whole and faithful, the gap
-/// is in the rebuild contract rather than in the enumeration — and until it is
-/// understood, asserting a root equality here would either be red or be made
-/// green by fitting the test to the answer. `07-build-plan.md §P8` carries the
-/// evidence and the reproduction.
+/// **It deliberately does not compare the rebuilt root with gen-1's**, and the
+/// reason is a finding rather than an omission: it cannot match. `RbTree` hashes
+/// the *structure* of the red-black tree, the structure depends on insertion
+/// order, gen-1 inserts in ingest order and the pages enumerate in key order. Same
+/// content, different shape, different root — measured here at `P8` (12 identical
+/// keys, three insertion orders, three roots). The property the handover really
+/// rests on is that a **canonical replay normalizes**, which is pinned where it
+/// belongs, next to the tree
+/// (`certified.rs::a_canonical_replay_of_the_pages_normalizes_whatever_order_gen1_grew_in`).
+/// Acceptance at cutover is that plus these two page properties — not equality
+/// with gen-1's own root.
 #[test]
 fn both_enumerations_cross_the_canister_boundary_whole_and_faithful() {
     /// Small on purpose — several pages per enumeration, so the cursor is

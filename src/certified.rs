@@ -587,41 +587,96 @@ mod tests {
     /// It works because a book leaf is the accumulated total and the law is a
     /// plain sum (§2): folding each total once reproduces the leaf exactly. The
     /// successor needs no knowledge of how gen-1 arrived there.
+    ///
+    /// **What the successor does NOT reproduce is gen-1's root, and that is a
+    /// property of the tree rather than a defect in the pages.** `RbTree`'s hash
+    /// is over the *structure* of the red-black tree, and the structure depends on
+    /// the order keys were inserted in. Gen-1 inserts in ingest order — whatever
+    /// order transactions arrived — while the pages enumerate in **key** order, so
+    /// a replay builds a differently-shaped tree over identical content and
+    /// commits a different root. Measured on the stand at `P8`: same 12 keys, same
+    /// values, three insertion orders, three roots.
+    ///
+    /// The earlier version of this test asserted root equality and passed — but
+    /// only because its keys (`[i; 32]`, ascending) happened to be inserted in key
+    /// order, so the two shapes coincided. It could not have gone red at the event
+    /// it existed for, which is the one thing a test must be able to do.
+    ///
+    /// So the property the handover actually rests on is the one asserted here:
+    /// **a canonical replay normalizes.** Whatever order the predecessor grew in,
+    /// replaying its pages produces the *same* successor — which is what makes the
+    /// handover verifiable by a third party, who replays the same pages and gets
+    /// the same root as the deployed gen-2. Acceptance at cutover is that equality
+    /// plus the key-value sets, not equality with gen-1's own root
+    /// (`crown-spec/docs/09-mainnet-runbook.md`).
     #[test]
-    fn a_successor_rebuilt_from_the_pages_reconstructs_the_same_root() {
-        let mut gen1 = Certified::new();
-        for i in 0..7u8 {
-            gen1.apply_settlement(settled(1, i, i.wrapping_add(1), 100 + u128::from(i)))
-                .unwrap();
-            gen1.apply_settlement(settled(2, i, i.wrapping_add(1), 9))
-                .unwrap();
-            gen1.record_birth(
-                [i; 32],
-                Birth {
-                    donor: [i.wrapping_add(100); 32],
-                    slot: u64::from(i),
-                },
-            );
-        }
+    fn a_canonical_replay_of_the_pages_normalizes_whatever_order_gen1_grew_in() {
+        // Two predecessors with identical content, grown in different orders —
+        // exactly what "ingest order is arbitrary" means in production.
+        let order_a: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+        let order_b: [u8; 7] = [4, 0, 6, 2, 5, 1, 3];
+        let grow = |order: &[u8]| {
+            let mut g = Certified::new();
+            for &i in order {
+                g.apply_settlement(settled(1, i, i.wrapping_add(1), 100 + u128::from(i)))
+                    .unwrap();
+                g.apply_settlement(settled(2, i, i.wrapping_add(1), 9))
+                    .unwrap();
+                g.record_birth(
+                    [i; 32],
+                    Birth {
+                        donor: [i.wrapping_add(100); 32],
+                        slot: u64::from(i),
+                    },
+                );
+            }
+            g
+        };
+        let gen1a = grow(&order_a);
+        let gen1b = grow(&order_b);
 
-        // The handoff: gen-2 folds every book entry once and copies every birth.
-        let mut gen2 = Certified::new();
-        for (chain, donor, recipient, gross) in gen1.book_page(None, 1_000) {
-            gen2.apply_settlement(Settled {
-                chain,
-                donor,
-                recipient,
-                gross,
-            })
-            .unwrap();
-        }
-        for (escrow, birth) in gen1.births_page(None, 1_000) {
-            gen2.record_birth(escrow, birth);
-        }
+        // The same content really is the same content…
+        assert_eq!(gen1a.book_keys(), gen1b.book_keys());
+        assert_eq!(gen1a.births_count(), gen1b.births_count());
+        assert_eq!(gen1a.book_page(None, 1_000), gen1b.book_page(None, 1_000));
+        assert_eq!(
+            gen1a.births_page(None, 1_000),
+            gen1b.births_page(None, 1_000)
+        );
 
-        assert_eq!(gen2.combined_root(), gen1.combined_root());
-        assert_eq!(gen2.book_keys(), gen1.book_keys());
-        assert_eq!(gen2.births_count(), gen1.births_count());
+        // …and the replay of that content is one successor, not two.
+        let replay = |src: &Certified| {
+            let mut g = Certified::new();
+            for (chain, donor, recipient, gross) in src.book_page(None, 1_000) {
+                g.apply_settlement(Settled {
+                    chain,
+                    donor,
+                    recipient,
+                    gross,
+                })
+                .unwrap();
+            }
+            for (escrow, birth) in src.births_page(None, 1_000) {
+                g.record_birth(escrow, birth);
+            }
+            g
+        };
+        let gen2a = replay(&gen1a);
+        let gen2b = replay(&gen1b);
+
+        assert_eq!(
+            gen2a.combined_root(),
+            gen2b.combined_root(),
+            "a canonical replay must not depend on how the predecessor grew — without \
+             this the successor is unverifiable by anyone who did not watch the ingests"
+        );
+        assert_eq!(gen2a.book_keys(), gen1a.book_keys());
+        assert_eq!(gen2a.births_count(), gen1a.births_count());
+        assert_eq!(gen2a.book_page(None, 1_000), gen1a.book_page(None, 1_000));
+        assert_eq!(
+            gen2a.births_page(None, 1_000),
+            gen1a.births_page(None, 1_000)
+        );
     }
 
     /// The count is kept, not derived (`RbTree` has no `len`), so re-recording an
